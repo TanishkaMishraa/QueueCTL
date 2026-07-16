@@ -19,8 +19,8 @@ def validate_max_retries(value) -> int:
         value = int(value)
     except (TypeError, ValueError):
         raise InvalidJobDataError("max_retries must be an integer")
-    if value < 1:
-        raise InvalidJobDataError("max_retries must be at least 1")
+    if value < 0:
+        raise InvalidJobDataError("max_retries cannot be negative")
     return value
 
 

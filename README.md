@@ -22,8 +22,9 @@ pip install -e ".[dev]"
 ```
 
 This installs a `queuectl` console command (via the `pyproject.toml`
-entry point) backed by `click` for the CLI and `SQLAlchemy` as the ORM over
-SQLite. `pytest` is installed as a dev dependency.
+entry point) backed by `click` for the CLI, `rich` for formatted output
+(panels/tables), and `SQLAlchemy` as the ORM over SQLite. `pytest` is
+installed as a dev dependency.
 
 By default, job/worker/config state lives in `./queuectl_data/queuectl.db`
 (created on first use, relative to the current working directory). Override
@@ -33,11 +34,20 @@ the test suite isolates each test into its own throwaway database.
 ## 2. Usage examples
 
 ```bash
-$ queuectl enqueue '{"id":"job1","command":"echo Hello World"}'
-Enqueued job job1 (state=pending, max_retries=3)
+$ queuectl enqueue "echo Hello World" --priority high --max-retries 5
++-- Job Created ------+
+| ID: 6362703482c3    |
+| State: pending      |
+| Max Retries: 5      |
+| Priority: 10        |
++----------------------+
 
-$ queuectl enqueue '{"command":"exit 1","max_retries":2}'
-Enqueued job a1b2c3d4e5f6 (state=pending, max_retries=2)
+$ queuectl enqueue '{"id":"job2","command":"exit 1","max_retries":2}'
++- Job Created --+
+| ID: job2       |
+| State: pending |
+| Max Retries: 2 |
++----------------+
 
 $ queuectl worker start --count 3
 Started 3 worker(s): 3f9a1c2b4d5e, 7b2e8f1a9c3d, 0d4f6a2e8b1c
@@ -58,7 +68,27 @@ Workers:
   0d4f6a2e8b1c   pid=41234   status=running  current_job=-              last_heartbeat=2026-07-16 10:02:11.302981
 
 $ queuectl list --state completed
-job1           completed  attempts=1/3   prio=0   cmd='echo Hello World'
++-----------------------------------------------------------------+
+| ID           | State     | Attempts | Priority | Command        |
+|--------------+-----------+----------+----------+----------------|
+| job1         | completed | 1/3      | 0        | echo Hello ... |
++-----------------------------------------------------------------+
+
+$ queuectl job show job2
++------------- Job job2 --------------+
+| ID: job2                            |
+| Command: exit 1                     |
+| State: dead                         |
+| Attempts: 2/2                       |
+| Priority: 0                         |
+| Created: 2026-07-16 19:28:32.887758 |
+| Updated: 2026-07-16 19:28:33.912004 |
+| Last Error: exit code 1             |
++--------------------------------------+
+
+$ queuectl job delete job2
+Delete job job2? [y/N]: y
+Deleted job job2
 
 $ queuectl dlq list
 a1b2c3d4e5f6   dead       attempts=2/2   prio=0   cmd='exit 1' last_error='exit code 1'
@@ -74,10 +104,19 @@ max_retries = 5
 backoff_base = 2
 poll_interval = 1
 heartbeat_interval = 2
+timeout = 30
 
 $ queuectl worker stop
 Stop requested for 3 worker(s); 3 confirmed stopped.
 ```
+
+(Panels/tables above are Rich output — actual box-drawing characters vary
+slightly by terminal; box-drawing falls back to plain ASCII automatically
+on legacy Windows consoles, which is also why panel titles avoid non-ASCII
+symbols like a checkmark glyph — that specific combination crashes with a
+`UnicodeEncodeError` under the default Windows `cp1252` codepage, a bug
+caught only by running the real CLI, not by `CliRunner`-based tests, since
+captured test output never goes through that console code path.)
 
 **Windows note**: job commands run through `cmd.exe` (via `shell=True`),
 which has no built-in `sleep`. The examples above and the assignment's
@@ -90,16 +129,26 @@ e.g. `python -c "import time; time.sleep(2)"` or PowerShell's
 
 | Command | Description |
 |---|---|
-| `queuectl enqueue '<json>'` | Add a job. Only `command` is required; `id`, `max_retries`, `priority`, `run_at` (ISO timestamp, for delayed jobs), `timeout_seconds` are optional. |
+| `queuectl enqueue "<command>" [--id ID] [--priority P] [--timeout SEC] [--max-retries N] [--run-at ISO]` | Add a job from a plain shell command. `--priority` accepts an integer or `low`/`normal`/`high`. |
+| `queuectl enqueue '<json>'` | Same command, JSON form — matches the assignment's original example (`{"id":"job1","command":"sleep 2"}`). Detected automatically: if the argument starts with `{` it's parsed as JSON, otherwise it's treated as a literal command. |
 | `queuectl worker start --count N [--foreground]` | Start N worker processes (detached background by default; `--foreground` runs a single worker in this terminal, Ctrl+C to stop). |
 | `queuectl worker stop [--timeout SEC]` | Ask all running workers to finish their current job and exit; waits up to `--timeout` seconds for confirmation. |
 | `queuectl status` | Job counts by state, attempt/success stats, and active worker list. |
-| `queuectl list [--state STATE] [--limit N]` | List jobs, optionally filtered by state. |
+| `queuectl list [--state STATE] [--limit N]` | List jobs (Rich table), optionally filtered by state. |
+| `queuectl job show <job_id>` | Show full details for one job (command, state, attempts, timestamps, last error). |
+| `queuectl job delete <job_id> [--yes]` | Delete a job permanently; prompts for confirmation unless `--yes`/`-y` is given. |
 | `queuectl dlq list` | List jobs in the Dead Letter Queue. |
 | `queuectl dlq retry <job_id>` | Reset a DLQ job back to `pending` (attempts reset to 0). |
 | `queuectl config set/get/list/reset` | Manage `max-retries`, `backoff-base`, `poll-interval`, `heartbeat-interval`, `timeout`. `reset [key]` restores one key (or all, if omitted) back to its default. |
 
 All commands support `--help`.
+
+**Not implemented**: `queuectl job search <term>` — the phase notes this
+one as a "future feature" rather than a requirement, and it isn't part of
+the assignment's own command list, so it's left out for now rather than
+adding CLI surface nothing else depends on. `queue_ops.list_jobs` would be
+the natural place to add a `command LIKE %term%` filter if it's wanted
+later.
 
 ## 3. Architecture overview
 
@@ -121,7 +170,12 @@ about SQLite/SQLAlchemy engine wiring.
 `create_job`, `get_job`, `list_jobs`, `update_job`, `delete_job`,
 `job_exists`, `get_pending_jobs` — plus the job-lifecycle operations that
 encode the actual state machine: `claim_job`, `complete_job`, `fail_job`,
-`dlq_list`, `dlq_retry`. `update_job` deliberately only allows editing
+`dlq_list`, `dlq_retry`. There's no separate "job service" layer between
+`cli.py` and `queue_ops.py`: `create_job` already generates the id (if not
+given), timestamps, and default state/retries and returns the `Job`
+object directly, and `cli.py` already calls it instead of touching
+SQLAlchemy directly — a pass-through service module in between would just
+forward every call unchanged. `update_job` deliberately only allows editing
 `command`/`max_retries`/`priority`/`run_at`/`timeout_seconds` — lifecycle
 fields (`state`, `attempts`, `next_retry`, `worker_id`, `last_error`) are
 only ever changed by the lifecycle functions, so there's exactly one code
@@ -133,7 +187,9 @@ config list` always shows the complete set of tunables even before
 anything has been overridden.
 
 **Validation & errors**: `validators.py` checks each job field in
-isolation (non-empty command, `max_retries >= 1`, `priority >= 0`,
+isolation (non-empty command, `max_retries >= 0` — a job created with
+`max_retries=0` is intentionally allowed and means "no retries, straight
+to the DLQ on first failure", `priority >= 0`,
 positive `timeout_seconds`, parseable `run_at`) and raises
 `InvalidJobDataError` on the first failure; duplicate-id checking lives in
 `queue_ops.create_job` instead (via `job_exists`) since it needs a
@@ -256,7 +312,35 @@ remain, the job goes to `failed` with `next_retry = now +
 backoff_base ** attempts`. The claim query treats `pending` jobs
 and `failed` jobs whose `next_retry` has elapsed as equally eligible —
 so there's no separate scheduler/reaper process needed to "wake up" failed
-jobs.
+jobs. The backoff math and the dead/retry decision themselves live in
+`retry.py` as two small, pure functions — `calculate_delay(attempts, base)`
+and `is_dead(attempts, max_retries)` — deliberately kept independent of
+the database so the exact delay sequence (2s/4s/8s/16s for `base=2`) and
+the retry-limit boundary are unit-tested directly (`tests/test_retry.py`)
+rather than only indirectly through a full `fail_job` call. `queue_ops.fail_job`
+calls both and applies the result to the `Job` row; the worker loop never
+computes a delay or a dead/alive decision itself, it only calls
+`fail_job` and logs whatever it decided.
+
+**Job execution** (`executor.py`, renamed from an earlier `execution.py`
+to match the "command executor" terminology): `run_command(command,
+timeout_seconds)` runs the job's command via `subprocess.run(shell=True)`,
+capturing `stdout`, `stderr`, `exit_code`, and `duration_seconds`
+(wall-clock time around the subprocess call) into an `ExecutionResult`.
+Exit code 0 is the only definition of success; everything else (non-zero
+exit, a shell "command not found", or a timeout) is a normal, retryable
+failure — there's no separate code path for "the command didn't exist"
+versus "the command ran and returned 1".
+
+**Worker activity logging**: each worker process appends plain-text
+lifecycle events — started, picked up job X, completed in N seconds,
+failed/retry-in-Ns, exceeded retries → DLQ, stopped — to `logs/worker.log`
+(`worker_logging.py`; override the directory with `QUEUECTL_LOG_DIR`).
+This is separate from the `job_logs` database table: `job_logs` is
+structured, queryable, per-attempt stdout/stderr/exit-code data (the job
+output logging bonus feature); `worker.log` is an operational log of
+*worker* activity you'd tail while a queue is running, e.g. to record the
+demo video (`scripts/worker_demo.py` prints its location).
 
 **Scheduling & priority (bonus)**: `run_at` (ISO timestamp) on a job makes
 it ineligible until that time — this is the `run_at`/delayed-jobs bonus
@@ -352,6 +436,15 @@ queuectl worker stop
 queuectl list           # jobs are still there
 ```
 
+Live worker demo (enqueues a varied batch — success, failure→retry→DLQ,
+priority, invalid command — starts 2 workers, and prints `status` every 2
+seconds for 10 seconds so you can watch state transitions happen; this is
+what recording the CLI demo video against is meant to look like):
+
+```bash
+python scripts/worker_demo.py
+```
+
 ## Demo
 
 <!-- Add the recorded CLI demo link here before submitting, per the assignment's Submission section. -->
@@ -361,5 +454,6 @@ queuectl list           # jobs are still there
 - Job timeout handling (`timeout_seconds` per job)
 - Job priority queues (`priority` field, higher first)
 - Scheduled/delayed jobs (`run_at`)
-- Job output logging (`job_logs` table: stdout/stderr/exit code per attempt)
+- Job output logging (`job_logs` table: stdout/stderr/exit code/duration per attempt)
+- Worker activity logging (`logs/worker.log`: started/picked/completed/failed/retry/DLQ/stopped events)
 - Execution stats (attempts logged + success rate in `queuectl status`)

@@ -1,17 +1,42 @@
 import json
 
 import click
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 
 from . import config as config_mod
 from . import database
 from . import queue_ops
 from . import worker_manager
-from .exceptions import QueueCTLError
+from .exceptions import JobNotFoundError, QueueCTLError
 from .models import State
+
+# Fixed width avoids Rich wrapping/truncating output differently depending
+# on whether stdout is a real terminal, a pipe, or captured by tests.
+_CONSOLE_WIDTH = 100
+
+_PRIORITY_ALIASES = {"low": -10, "normal": 0, "high": 10}
 
 
 def _session():
     return database.get_session()
+
+
+def _console() -> Console:
+    return Console(width=_CONSOLE_WIDTH)
+
+
+def _parse_priority(value):
+    text = str(value).strip().lower()
+    if text in _PRIORITY_ALIASES:
+        return _PRIORITY_ALIASES[text]
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise click.ClickException(
+            f"Invalid --priority {value!r}: use an integer, or one of low/normal/high"
+        )
 
 
 def _job_row(job) -> str:
@@ -21,35 +46,106 @@ def _job_row(job) -> str:
     )
 
 
+def _jobs_table(jobs) -> Table:
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("ID")
+    table.add_column("State")
+    table.add_column("Attempts")
+    table.add_column("Priority")
+    table.add_column("Command")
+    for job in jobs:
+        table.add_row(job.id, job.state, f"{job.attempts}/{job.max_retries}", str(job.priority), job.command)
+    return table
+
+
+def _job_created_panel(job) -> Panel:
+    body = (
+        f"[bold]ID[/bold]: {job.id}\n"
+        f"[bold]State[/bold]: {job.state}\n"
+        f"[bold]Max Retries[/bold]: {job.max_retries}\n"
+        f"[bold]Priority[/bold]: {job.priority}"
+    )
+    # Plain ASCII title only: Rich's legacy-Windows-console writer crashes
+    # (UnicodeEncodeError under the default cp1252 codepage) on non-ASCII
+    # glyphs like a checkmark, and CliRunner's captured-output tests don't
+    # exercise that real-console code path, so this can't be caught by the
+    # test suite -- it only surfaces when actually run in a terminal.
+    return Panel(body, title="[green]Job Created[/green]", expand=False)
+
+
+def _job_details_panel(job) -> Panel:
+    lines = [
+        f"[bold]ID[/bold]: {job.id}",
+        f"[bold]Command[/bold]: {job.command}",
+        f"[bold]State[/bold]: {job.state}",
+        f"[bold]Attempts[/bold]: {job.attempts}/{job.max_retries}",
+        f"[bold]Priority[/bold]: {job.priority}",
+        f"[bold]Created[/bold]: {job.created_at}",
+        f"[bold]Updated[/bold]: {job.updated_at}",
+    ]
+    if job.run_at:
+        lines.append(f"[bold]Run At[/bold]: {job.run_at}")
+    if job.timeout_seconds:
+        lines.append(f"[bold]Timeout[/bold]: {job.timeout_seconds}s")
+    if job.last_error:
+        lines.append(f"[bold]Last Error[/bold]: {job.last_error}")
+    return Panel("\n".join(lines), title=f"Job {job.id}", expand=False)
+
+
 @click.group()
 def main():
     """queuectl - a CLI-based background job queue with workers, retries, and a DLQ."""
 
 
 @main.command()
-@click.argument("job_json")
-def enqueue(job_json):
+@click.argument("job_arg")
+@click.option("--id", "job_id", default=None, help="Custom job id (default: auto-generated).")
+@click.option("--priority", default=None, help="Integer, or one of low/normal/high (default: normal/0).")
+@click.option("--timeout", "timeout_seconds", default=None, type=int, help="Per-job timeout in seconds.")
+@click.option("--max-retries", "max_retries", default=None, type=int, help="Max attempts before moving to the DLQ.")
+@click.option("--run-at", default=None, help="ISO timestamp; job won't be claimed before this time.")
+def enqueue(job_arg, job_id, priority, timeout_seconds, max_retries, run_at):
     """Add a new job to the queue.
 
-    JOB_JSON is a JSON object with at least a "command" field, e.g.
-    queuectl enqueue '{"id":"job1","command":"sleep 2"}'
+    JOB_ARG is either a plain shell command:
+
+        queuectl enqueue "echo Hello World" --priority high --timeout 30
+
+    or a JSON object, matching the assignment's original example:
+
+        queuectl enqueue '{"id":"job1","command":"sleep 2"}'
     """
-    try:
-        data = json.loads(job_json)
-    except json.JSONDecodeError as exc:
-        raise click.ClickException(f"Invalid JSON: {exc}")
-    if not isinstance(data, dict):
-        raise click.ClickException("Job payload must be a JSON object")
+    stripped = job_arg.strip()
+    if stripped.startswith("{"):
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise click.ClickException(f"Invalid JSON: {exc}")
+        if not isinstance(data, dict):
+            raise click.ClickException("Job payload must be a JSON object")
+    else:
+        data = {"command": job_arg}
+
+    if job_id is not None:
+        data.setdefault("id", job_id)
+    if priority is not None:
+        data["priority"] = _parse_priority(priority)
+    if timeout_seconds is not None:
+        data["timeout_seconds"] = timeout_seconds
+    if max_retries is not None:
+        data["max_retries"] = max_retries
+    if run_at is not None:
+        data["run_at"] = run_at
 
     session = _session()
     try:
         job = queue_ops.create_job(session, data)
-        message = f"Enqueued job {job.id} (state={job.state}, max_retries={job.max_retries})"
+        panel = _job_created_panel(job)
     except QueueCTLError as exc:
         raise click.ClickException(str(exc))
     finally:
         session.close()
-    click.echo(message)
+    _console().print(panel)
 
 
 @main.group()
@@ -119,14 +215,55 @@ def list_cmd(state, limit):
     session = _session()
     try:
         jobs = queue_ops.list_jobs(session, state=state, limit=limit)
-        lines = [_job_row(job) for job in jobs]
+        table = _jobs_table(jobs) if jobs else None
     finally:
         session.close()
-    if not lines:
+    if table is None:
         click.echo("No jobs found.")
         return
-    for line in lines:
-        click.echo(line)
+    _console().print(table)
+
+
+@main.group()
+def job():
+    """Inspect or delete a specific job by id."""
+
+
+@job.command("show")
+@click.argument("job_id")
+def job_show(job_id):
+    """Show full details for one job."""
+    session = _session()
+    try:
+        existing = queue_ops.get_job(session, job_id)
+        if existing is None:
+            raise JobNotFoundError(f"Job not found: {job_id}")
+        panel = _job_details_panel(existing)
+    except QueueCTLError as exc:
+        raise click.ClickException(str(exc))
+    finally:
+        session.close()
+    _console().print(panel)
+
+
+@job.command("delete")
+@click.argument("job_id")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
+def job_delete(job_id, yes):
+    """Delete a job permanently."""
+    session = _session()
+    try:
+        if queue_ops.get_job(session, job_id) is None:
+            raise JobNotFoundError(f"Job not found: {job_id}")
+        if not yes and not click.confirm(f"Delete job {job_id}?", default=False):
+            click.echo("Aborted.")
+            return
+        queue_ops.delete_job(session, job_id)
+    except QueueCTLError as exc:
+        raise click.ClickException(str(exc))
+    finally:
+        session.close()
+    click.echo(f"Deleted job {job_id}")
 
 
 @main.group()

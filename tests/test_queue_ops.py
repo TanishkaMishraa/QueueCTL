@@ -10,7 +10,7 @@ from queuectl.exceptions import (
     InvalidJobStateError,
     JobNotFoundError,
 )
-from queuectl.execution import ExecutionResult
+from queuectl.executor import ExecutionResult
 from queuectl.models import State
 from queuectl.utils import utcnow
 

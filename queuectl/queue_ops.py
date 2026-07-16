@@ -8,9 +8,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from . import config as config_mod
+from . import retry
 from . import validators
 from .exceptions import DatabaseError, DuplicateJobError, InvalidJobStateError, JobNotFoundError
-from .execution import ExecutionResult
+from .executor import ExecutionResult
 from .models import Job, JobLog, State, Worker
 from .utils import after_seconds, new_id, utcnow
 
@@ -201,12 +202,12 @@ def fail_job(session: Session, job: Job, result: ExecutionResult, started_at, ba
     job.last_error = reason[:2000]
     job.updated_at = now
 
-    if job.attempts >= job.max_retries:
+    if retry.is_dead(job.attempts, job.max_retries):
         job.state = State.DEAD
         job.next_retry = None
     else:
         job.state = State.FAILED
-        job.next_retry = after_seconds(backoff_base ** job.attempts)
+        job.next_retry = after_seconds(retry.calculate_delay(job.attempts, backoff_base))
 
     _log_attempt(session, job.id, job.attempts, result, started_at, now)
     session.commit()

@@ -14,9 +14,11 @@ import time
 from . import config as config_mod
 from . import database
 from . import queue_ops
-from .execution import run_command
-from .models import Worker
+from . import retry
+from .executor import run_command
+from .models import State, Worker
 from .utils import new_id, utcnow
+from .worker_logging import get_worker_logger
 
 _stop_requested = False
 
@@ -39,6 +41,7 @@ def run(worker_id: str = None) -> None:
     session = database.get_session()
     worker_id = worker_id or new_id()
     now = utcnow()
+    logger = get_worker_logger()
 
     worker_row = Worker(
         worker_id=worker_id,
@@ -51,6 +54,7 @@ def run(worker_id: str = None) -> None:
     )
     session.add(worker_row)
     session.commit()
+    logger.info(f"[{worker_id}] Worker started (pid={os.getpid()})")
 
     try:
         # Each loop iteration re-reads worker_row.stop_requested: the
@@ -68,6 +72,7 @@ def run(worker_id: str = None) -> None:
                 time.sleep(poll_interval)
                 continue
 
+            logger.info(f"[{worker_id}] Picked job {job.id}: {job.command!r}")
             worker_row.current_job_id = job.id
             worker_row.last_heartbeat = utcnow()
             session.commit()
@@ -77,8 +82,17 @@ def run(worker_id: str = None) -> None:
 
             if result.exit_code == 0:
                 queue_ops.complete_job(session, job, result, started_at)
+                logger.info(f"[{worker_id}] Job {job.id} completed in {result.duration_seconds:.2f}s")
             else:
                 queue_ops.fail_job(session, job, result, started_at, backoff_base)
+                if job.state == State.DEAD:
+                    logger.info(f"[{worker_id}] Job {job.id} exceeded retries ({job.attempts}/{job.max_retries}), moved to DLQ")
+                else:
+                    delay = retry.calculate_delay(job.attempts, backoff_base)
+                    logger.info(
+                        f"[{worker_id}] Job {job.id} failed (attempt {job.attempts}/{job.max_retries}), "
+                        f"retry in {delay:.0f}s"
+                    )
 
             worker_row.current_job_id = None
             worker_row.last_heartbeat = utcnow()
@@ -90,6 +104,7 @@ def run(worker_id: str = None) -> None:
         worker_row.last_heartbeat = utcnow()
         session.commit()
         session.close()
+        logger.info(f"[{worker_id}] Worker stopped")
 
 
 if __name__ == "__main__":

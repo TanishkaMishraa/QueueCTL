@@ -140,3 +140,25 @@ of `create_job`. Splitting it up on purpose:
   let a caller set `state="dead"` directly, there would be two competing
   ways to move a job into the DLQ, and the atomic-claim guarantee
   wouldn't protect a state written through this door.
+
+## Why a retryable failure stays visibly `failed` instead of resetting straight to `pending`
+
+A tempting simplification for scheduling a retry: reset the job's `state`
+back to `pending` immediately, with a future `next_retry`, and let the
+claim query's `next_retry <= now` filter hold it back. Nothing about
+correctness breaks if you do this — the job still won't be claimed early.
+
+It was deliberately not done, though, because the assignment's own Job
+Lifecycle table defines `failed` as a distinct, meaningful state
+("Failed, but retryable") alongside `pending`, `processing`, `completed`,
+`dead` — five states, not four. If a retry-scheduled job's `state` reads
+`pending`, there is no way to tell it apart from a job that has never been
+attempted at all: `queuectl list --state pending` and `queuectl status`
+would both undercount "how many jobs have actually failed at least once"
+and silently misreport `pending` as larger than it really is. Keeping
+`state='failed'` until the backoff elapses — and having the claim query
+treat `pending` and `(failed AND next_retry <= now)` as equally eligible —
+gets the same "don't retry early" behavior without losing that
+observability. The cost is one extra `OR` clause in `claim_job`'s `WHERE`;
+the benefit is that every one of the assignment's five documented states
+is actually reachable and visible through the CLI.
