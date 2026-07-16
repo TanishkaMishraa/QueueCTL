@@ -107,3 +107,36 @@ The general lesson: with a single global `BEGIN IMMEDIATE` hook, any
 session that loops and reads without committing is implicitly holding a
 write lock the whole time. Every polling loop in this codebase now commits
 (or closes its session) once per iteration.
+
+## Why validation, duplicate-checking, and exceptions live in three different places
+
+It would be simpler to shove all of it into one big `if` block at the top
+of `create_job`. Splitting it up on purpose:
+
+- **`validators.py` never touches the database.** Each `validate_*`
+  function checks one field in isolation and raises `InvalidJobDataError`.
+  That means they're trivially unit-testable without a session fixture,
+  and they can be reused by both `create_job` and `update_job` (a job's
+  `priority` gets the exact same "must be >= 0" rule whether it's set at
+  creation or changed later) instead of duplicating the check.
+- **Duplicate-id checking stays in `queue_ops.create_job`, not
+  validators.py**, because it's the one check that *does* need a database
+  read (`job_exists`). Keeping "pure field shape" and "does this conflict
+  with existing data" as two different kinds of check makes it obvious,
+  reading either file, which category a given failure belongs to.
+- **Exceptions all subclass one `QueueCTLError`** specifically so `cli.py`
+  can catch one thing per command instead of an ever-growing tuple
+  (`except (KeyError, ValueError, InvalidJobDataError, ...)`). Each
+  command still gets a clean, specific message, because the exception's
+  own `str()` carries that detail — the CLI layer just needs to know
+  "this was an expected, user-facing failure" versus "something
+  unexpected broke," not the exact subclass.
+- **`update_job` has an explicit allow-list of editable fields**
+  (`command`, `max_retries`, `priority`, `run_at`, `timeout_seconds`)
+  rather than accepting arbitrary `**fields` and setting whatever
+  attribute name shows up. Lifecycle fields (`state`, `attempts`,
+  `next_retry`, `worker_id`, `last_error`) can only change through
+  `claim_job`/`complete_job`/`fail_job`/`dlq_retry` — if `update_job` also
+  let a caller set `state="dead"` directly, there would be two competing
+  ways to move a job into the DLQ, and the atomic-claim guarantee
+  wouldn't protect a state written through this door.

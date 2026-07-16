@@ -97,18 +97,53 @@ e.g. `python -c "import time; time.sleep(2)"` or PowerShell's
 | `queuectl list [--state STATE] [--limit N]` | List jobs, optionally filtered by state. |
 | `queuectl dlq list` | List jobs in the Dead Letter Queue. |
 | `queuectl dlq retry <job_id>` | Reset a DLQ job back to `pending` (attempts reset to 0). |
-| `queuectl config set/get/list` | Manage `max-retries`, `backoff-base`, `poll-interval`, `heartbeat-interval`. |
+| `queuectl config set/get/list/reset` | Manage `max-retries`, `backoff-base`, `poll-interval`, `heartbeat-interval`, `timeout`. `reset [key]` restores one key (or all, if omitted) back to its default. |
 
 All commands support `--help`.
 
 ## 3. Architecture overview
 
 **Layering**: `cli.py` (Click commands) → `queue_ops.py` / `config.py`
-(business logic, operating on a SQLAlchemy `Session`) → `models.py`
-(declarative ORM models) → `database.py` (engine + session factory) →
-SQLite. Each layer has one job: the CLI parses args and formats output,
-`queue_ops.py` owns every state transition, `models.py` is pure schema, and
-`database.py` is the only place that knows about SQLite/SQLAlchemy wiring.
+(the repository layer — the *only* place that writes ORM queries, all
+operating on a SQLAlchemy `Session`) → `validators.py` (pure field
+validation, no DB access) / `models.py` (declarative ORM models) →
+`database.py` (engine + session factory) → SQLite, with `constants.py`
+(state names, default config values) and `exceptions.py` (the
+`QueueCTLError` hierarchy) used across every layer. Each layer has one
+job: the CLI parses args, formats output, and translates `QueueCTLError`s
+into `click.ClickException`; `queue_ops.py` owns every state transition
+and is the only module allowed to touch `Session.query`/`add`/`delete`;
+`validators.py` rejects bad input before it reaches the database;
+`models.py` is pure schema; `database.py` is the only place that knows
+about SQLite/SQLAlchemy engine wiring.
+
+**Repository layer** (`queue_ops.py`): generic CRUD —
+`create_job`, `get_job`, `list_jobs`, `update_job`, `delete_job`,
+`job_exists`, `get_pending_jobs` — plus the job-lifecycle operations that
+encode the actual state machine: `claim_job`, `complete_job`, `fail_job`,
+`dlq_list`, `dlq_retry`. `update_job` deliberately only allows editing
+`command`/`max_retries`/`priority`/`run_at`/`timeout_seconds` — lifecycle
+fields (`state`, `attempts`, `next_retry`, `worker_id`, `last_error`) are
+only ever changed by the lifecycle functions, so there's exactly one code
+path that can move a job between states. **Config repository**
+(`config.py`): `get_config`/`set_config`/`reset_config`/`get_all`, plus
+`load_defaults` which seeds the `config` table with every known default
+key (idempotent — called on every `database.get_session()`), so `queuectl
+config list` always shows the complete set of tunables even before
+anything has been overridden.
+
+**Validation & errors**: `validators.py` checks each job field in
+isolation (non-empty command, `max_retries >= 1`, `priority >= 0`,
+positive `timeout_seconds`, parseable `run_at`) and raises
+`InvalidJobDataError` on the first failure; duplicate-id checking lives in
+`queue_ops.create_job` instead (via `job_exists`) since it needs a
+database read, which validators.py deliberately never does. All
+queuectl-specific failures subclass `exceptions.QueueCTLError` —
+`JobNotFoundError`, `DuplicateJobError`, `InvalidJobDataError`,
+`InvalidJobStateError` (e.g. `dlq retry` on a job that isn't dead),
+`InvalidConfiguration`, `DatabaseError` — so `cli.py` can catch the single
+base class and print a clean message instead of leaking a raw
+`ValueError`/`KeyError`/SQLAlchemy traceback.
 
 **Job lifecycle**: `pending` → `processing` → `completed` | `failed` → (`pending` again, after backoff) | `dead`.
 
@@ -138,6 +173,45 @@ by default) in WAL mode, modeled as four SQLAlchemy ORM classes in
 - `JobLog` (table `job_logs`) — one row per execution attempt
   (stdout/stderr/exit code/timing) — job output logging and the
   success-rate stat in `status` are built directly from this table.
+
+```
+┌───────────────────────────┐        ┌──────────────────────┐
+│ jobs                      │        │ job_logs             │
+├───────────────────────────┤        ├──────────────────────┤
+│ id            TEXT PK     │◄──┐    │ id           PK      │
+│ command       TEXT        │   │    │ job_id       TEXT ───┼──┐
+│ state         TEXT        │   └────┼──────────────────────┘  │
+│ attempts      INT         │        │ attempt      INT        │
+│ max_retries   INT         │        │ stdout       TEXT       │
+│ priority      INT         │        │ stderr       TEXT       │
+│ run_at        DATETIME    │        │ exit_code    INT        │
+│ next_retry    DATETIME    │        │ started_at   DATETIME   │
+│ timeout_secs  INT         │        │ finished_at  DATETIME   │
+│ worker_id     TEXT        │        └──────────────────────┘  │
+│ last_error    TEXT        │  (job_id is a soft reference --  │
+│ created_at    DATETIME    │   logs outlive a deleted job     │
+│ updated_at    DATETIME    │   for audit purposes) ───────────┘
+└───────────────────────────┘
+
+┌───────────────────────────┐        ┌──────────────────────┐
+│ workers                   │        │ config               │
+├───────────────────────────┤        ├──────────────────────┤
+│ worker_id     TEXT PK     │        │ key         TEXT PK  │
+│ pid           INT         │        │ value       TEXT     │
+│ status        TEXT        │        └──────────────────────┘
+│ stop_requested BOOL       │        (max_retries, backoff_base,
+│ current_job_id TEXT       │         poll_interval, heartbeat_interval,
+│ started_at    DATETIME    │         timeout -- one row per key,
+│ last_heartbeat DATETIME   │         seeded by config.load_defaults)
+└───────────────────────────┘
+```
+
+There's no foreign key from `jobs.worker_id` to `workers.worker_id` or
+from `job_logs.job_id` to `jobs.id` — both are intentionally soft
+references. A job's logs should stay queryable even if the job row itself
+is later deleted via `queue_ops.delete_job` (audit trail), and a worker
+row can legitimately outlive the job it last touched (job completes,
+worker moves on).
 
 **Worker logic & locking**: `queuectl worker start --count N` spawns N
 detached OS processes (`python -m queuectl.worker`), each running an
@@ -228,6 +302,14 @@ and treated as an ordinary failure (retryable like any other).
 - **No distributed/multi-host coordination**: everything assumes a single
   shared SQLite file on one machine (as scoped by the assignment); it does
   not attempt multi-host queue semantics.
+- **`timeout` config default exists but isn't auto-applied**: `constants.DEFAULT_TIMEOUT`
+  (30s) and a `timeout` config key exist for consistency with `max_retries`/
+  `backoff_base`, but a job's `timeout_seconds` still defaults to `None`
+  (no timeout) unless the job explicitly sets it — unlike `max_retries`,
+  which *does* fall back to the config default. Silently capping every
+  job at 30s by default felt like a surprising behavior change for a
+  feature the assignment lists as optional; explicit opt-in avoids
+  breaking a legitimately long-running job that never asked for a limit.
 
 ## 5. Testing instructions
 
@@ -246,6 +328,15 @@ commands failing gracefully, and persistence across a restart):
 
 ```bash
 python scripts/validate_e2e.py
+```
+
+Repository-layer integration check (calls `queue_ops.py`/`config.py`
+directly against a real SQLite file — Create → Read → Update → Delete,
+duplicate/missing-id errors, and a config override surviving a simulated
+restart):
+
+```bash
+python scripts/validate_db.py
 ```
 
 Manual smoke test:

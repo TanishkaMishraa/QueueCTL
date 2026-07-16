@@ -6,6 +6,7 @@ from . import config as config_mod
 from . import database
 from . import queue_ops
 from . import worker_manager
+from .exceptions import QueueCTLError
 from .models import State
 
 
@@ -42,9 +43,9 @@ def enqueue(job_json):
 
     session = _session()
     try:
-        job = queue_ops.enqueue_job(session, data)
+        job = queue_ops.create_job(session, data)
         message = f"Enqueued job {job.id} (state={job.state}, max_retries={job.max_retries})"
-    except ValueError as exc:
+    except QueueCTLError as exc:
         raise click.ClickException(str(exc))
     finally:
         session.close()
@@ -158,7 +159,7 @@ def dlq_retry_cmd(job_id):
         try:
             job = queue_ops.dlq_retry(session, job_id)
             message = f"Job {job.id} requeued (state={job.state})"
-        except (KeyError, ValueError) as exc:
+        except QueueCTLError as exc:
             raise click.ClickException(str(exc))
     finally:
         session.close()
@@ -177,7 +178,7 @@ def config_set(key, value):
     """Set a configuration value, e.g. queuectl config set max-retries 3"""
     session = _session()
     try:
-        config_mod.set(session, key.replace("-", "_"), value)
+        config_mod.set_config(session, key.replace("-", "_"), value)
     finally:
         session.close()
     click.echo(f"Set {key} = {value}")
@@ -191,8 +192,8 @@ def config_get(key):
     try:
         if key:
             try:
-                value = config_mod.get(session, key.replace("-", "_"))
-            except KeyError as exc:
+                value = config_mod.get_config(session, key.replace("-", "_"))
+            except QueueCTLError as exc:
                 raise click.ClickException(str(exc))
             click.echo(f"{key} = {value}")
         else:
@@ -211,6 +212,22 @@ def config_list():
             click.echo(f"{k} = {v}")
     finally:
         session.close()
+
+
+@config.command("reset")
+@click.argument("key", required=False)
+def config_reset(key):
+    """Reset one configuration value (or all, if no key given) back to its default."""
+    session = _session()
+    try:
+        normalized = key.replace("-", "_") if key else None
+        try:
+            config_mod.reset_config(session, normalized)
+        except QueueCTLError as exc:
+            raise click.ClickException(str(exc))
+    finally:
+        session.close()
+    click.echo(f"Reset {key}" if key else "Reset all configuration values to defaults")
 
 
 if __name__ == "__main__":

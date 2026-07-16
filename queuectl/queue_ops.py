@@ -1,32 +1,41 @@
+"""Repository layer: the only module that writes SQL/ORM queries for the
+`jobs` table. Every other module (cli.py, worker.py) goes through here.
+"""
 from typing import List, Optional
 
 from sqlalchemy import and_, func, or_
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from . import config as config_mod
+from . import validators
+from .exceptions import DatabaseError, DuplicateJobError, InvalidJobStateError, JobNotFoundError
 from .execution import ExecutionResult
 from .models import Job, JobLog, State, Worker
-from .utils import after_seconds, new_id, parse_iso, utcnow
+from .utils import after_seconds, new_id, utcnow
+
+# --------------------------------------------------------------------------
+# Repository CRUD
+# --------------------------------------------------------------------------
 
 
-def enqueue_job(session: Session, data: dict) -> Job:
-    command = data.get("command")
-    if not command or not str(command).strip():
-        raise ValueError("Job requires a non-empty 'command' field")
-
+def create_job(session: Session, data: dict) -> Job:
+    command = validators.validate_command(data.get("command"))
     job_id = str(data.get("id") or new_id())
-    if session.get(Job, job_id) is not None:
-        raise ValueError(f"Job id already exists: {job_id}")
+    if job_exists(session, job_id):
+        raise DuplicateJobError(f"Job id already exists: {job_id}")
 
-    max_retries = int(data.get("max_retries", config_mod.get_int(session, "max_retries")))
-    priority = int(data.get("priority", 0))
-    run_at = parse_iso(data.get("run_at"))
-    timeout_seconds = data.get("timeout_seconds")
+    max_retries = validators.validate_max_retries(
+        data.get("max_retries", config_mod.get_int(session, "max_retries"))
+    )
+    priority = validators.validate_priority(data.get("priority", 0))
+    run_at = validators.validate_run_at(data.get("run_at"))
+    timeout_seconds = validators.validate_timeout_seconds(data.get("timeout_seconds"))
     now = utcnow()
 
     job = Job(
         id=job_id,
-        command=str(command),
+        command=command,
         state=State.PENDING,
         attempts=0,
         max_retries=max_retries,
@@ -37,12 +46,86 @@ def enqueue_job(session: Session, data: dict) -> Job:
         updated_at=now,
     )
     session.add(job)
-    session.commit()
+    try:
+        session.commit()
+    except SQLAlchemyError as exc:
+        session.rollback()
+        raise DatabaseError(f"Failed to create job {job_id}: {exc}") from exc
     return job
 
 
 def get_job(session: Session, job_id: str) -> Optional[Job]:
     return session.get(Job, job_id)
+
+
+def job_exists(session: Session, job_id: str) -> bool:
+    return session.get(Job, job_id) is not None
+
+
+def list_jobs(session: Session, state: Optional[str] = None, limit: Optional[int] = None) -> List[Job]:
+    query = session.query(Job)
+    if state:
+        query = query.filter(Job.state == state)
+    query = query.order_by(Job.created_at.desc())
+    if limit:
+        query = query.limit(limit)
+    return query.all()
+
+
+def get_pending_jobs(session: Session, limit: Optional[int] = None) -> List[Job]:
+    return list_jobs(session, state=State.PENDING, limit=limit)
+
+
+_UPDATABLE_FIELDS = {
+    "command": validators.validate_command,
+    "max_retries": validators.validate_max_retries,
+    "priority": validators.validate_priority,
+    "run_at": validators.validate_run_at,
+    "timeout_seconds": validators.validate_timeout_seconds,
+}
+
+
+def update_job(session: Session, job_id: str, **fields) -> Job:
+    """Generic partial update for the fields a caller is allowed to change
+    directly. Lifecycle fields (state/attempts/next_retry/worker_id/
+    last_error) are intentionally not editable here -- those only change
+    through claim_job/complete_job/fail_job/dlq_retry, which encode the
+    actual state-machine rules."""
+    job = get_job(session, job_id)
+    if job is None:
+        raise JobNotFoundError(f"Job not found: {job_id}")
+
+    unknown = set(fields) - set(_UPDATABLE_FIELDS)
+    if unknown:
+        raise ValueError(f"Cannot update field(s): {', '.join(sorted(unknown))}")
+
+    for field, value in fields.items():
+        setattr(job, field, _UPDATABLE_FIELDS[field](value))
+    job.updated_at = utcnow()
+
+    try:
+        session.commit()
+    except SQLAlchemyError as exc:
+        session.rollback()
+        raise DatabaseError(f"Failed to update job {job_id}: {exc}") from exc
+    return job
+
+
+def delete_job(session: Session, job_id: str) -> None:
+    job = get_job(session, job_id)
+    if job is None:
+        raise JobNotFoundError(f"Job not found: {job_id}")
+    session.delete(job)
+    try:
+        session.commit()
+    except SQLAlchemyError as exc:
+        session.rollback()
+        raise DatabaseError(f"Failed to delete job {job_id}: {exc}") from exc
+
+
+# --------------------------------------------------------------------------
+# Job lifecycle (claim -> complete/fail -> DLQ)
+# --------------------------------------------------------------------------
 
 
 def claim_job(session: Session, worker_id: str) -> Optional[Job]:
@@ -129,16 +212,6 @@ def fail_job(session: Session, job: Job, result: ExecutionResult, started_at, ba
     session.commit()
 
 
-def list_jobs(session: Session, state: Optional[str] = None, limit: Optional[int] = None) -> List[Job]:
-    query = session.query(Job)
-    if state:
-        query = query.filter(Job.state == state)
-    query = query.order_by(Job.created_at.desc())
-    if limit:
-        query = query.limit(limit)
-    return query.all()
-
-
 def dlq_list(session: Session) -> List[Job]:
     return list_jobs(session, state=State.DEAD)
 
@@ -146,9 +219,9 @@ def dlq_list(session: Session) -> List[Job]:
 def dlq_retry(session: Session, job_id: str) -> Job:
     job = get_job(session, job_id)
     if job is None:
-        raise KeyError(f"Job not found: {job_id}")
+        raise JobNotFoundError(f"Job not found: {job_id}")
     if job.state != State.DEAD:
-        raise ValueError(f"Job {job_id} is not in the DLQ (current state: {job.state})")
+        raise InvalidJobStateError(f"Job {job_id} is not in the DLQ (current state: {job.state})")
 
     job.state = State.PENDING
     job.attempts = 0

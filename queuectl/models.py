@@ -1,17 +1,21 @@
 from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text
 
+from queuectl import constants
 from queuectl.database import Base
 from queuectl.utils import utcnow
 
 
 class State:
-    PENDING = "pending"
-    PROCESSING = "processing"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    DEAD = "dead"
+    """Thin, importable facade over constants.py so existing call sites
+    (State.PENDING, State.ALL, ...) don't need to change."""
 
-    ALL = (PENDING, PROCESSING, COMPLETED, FAILED, DEAD)
+    PENDING = constants.PENDING
+    PROCESSING = constants.PROCESSING
+    COMPLETED = constants.COMPLETED
+    FAILED = constants.FAILED
+    DEAD = constants.DEAD
+
+    ALL = constants.ALL_STATES
 
 
 class Job(Base):
@@ -19,13 +23,13 @@ class Job(Base):
 
     id = Column(String, primary_key=True)
     command = Column(String, nullable=False)
-    state = Column(String, nullable=False, default=State.PENDING)
+    state = Column(String, nullable=False, default=constants.PENDING)
     attempts = Column(Integer, default=0, nullable=False)
-    max_retries = Column(Integer, default=3, nullable=False)
+    max_retries = Column(Integer, default=constants.DEFAULT_RETRIES, nullable=False)
 
     # Bonus-feature columns beyond the minimal spec: priority queues,
     # run_at scheduling/delayed jobs, and per-job timeout handling.
-    priority = Column(Integer, default=0, nullable=False)
+    priority = Column(Integer, default=constants.DEFAULT_PRIORITY, nullable=False)
     run_at = Column(DateTime, nullable=True)
     timeout_seconds = Column(Integer, nullable=True)
     worker_id = Column(String, nullable=True)

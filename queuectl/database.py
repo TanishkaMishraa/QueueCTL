@@ -41,13 +41,25 @@ def _make_engine(db_path: Path = None):
 
 
 def init_db(db_path: Path = None) -> None:
+    """Create tables (if the database file doesn't exist yet, or is
+    missing tables) and seed default config rows. Safe to call repeatedly:
+    CREATE TABLE IF NOT EXISTS + load_defaults' own existing-key check
+    mean an already-initialized database is just reused as-is."""
+    from queuectl import config as config_mod
     from queuectl import models  # noqa: F401  (registers Job/Config/Worker on Base)
 
     engine = _make_engine(db_path)
     Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(bind=engine, future=True)
+    session = SessionLocal()
+    try:
+        config_mod.load_defaults(session)
+    finally:
+        session.close()
 
 
 def get_session(db_path: Path = None):
+    from queuectl import config as config_mod
     from queuectl import models  # noqa: F401
 
     engine = _make_engine(db_path)
@@ -57,4 +69,6 @@ def get_session(db_path: Path = None):
     # job-state changes committed by *other* processes, not a stale
     # in-memory copy from before its last commit.
     SessionLocal = sessionmaker(bind=engine, future=True)
-    return SessionLocal()
+    session = SessionLocal()
+    config_mod.load_defaults(session)
+    return session
