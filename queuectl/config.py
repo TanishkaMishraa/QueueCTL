@@ -1,4 +1,6 @@
-import sqlite3
+from sqlalchemy.orm import Session
+
+from .models import Config
 
 DEFAULTS = {
     "max_retries": "3",
@@ -8,33 +10,33 @@ DEFAULTS = {
 }
 
 
-def get_all(conn: sqlite3.Connection) -> dict:
-    rows = conn.execute("SELECT key, value FROM config").fetchall()
+def get_all(session: Session) -> dict:
     merged = dict(DEFAULTS)
-    merged.update({row["key"]: row["value"] for row in rows})
+    merged.update({row.key: row.value for row in session.query(Config).all()})
     return merged
 
 
-def get(conn: sqlite3.Connection, key: str) -> str:
-    row = conn.execute("SELECT value FROM config WHERE key = ?", (key,)).fetchone()
+def get(session: Session, key: str) -> str:
+    row = session.get(Config, key)
     if row is not None:
-        return row["value"]
+        return row.value
     if key in DEFAULTS:
         return DEFAULTS[key]
     raise KeyError(f"Unknown config key: {key}")
 
 
-def set(conn: sqlite3.Connection, key: str, value: str) -> None:
-    conn.execute(
-        "INSERT INTO config (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, value),
-    )
+def set(session: Session, key: str, value: str) -> None:
+    row = session.get(Config, key)
+    if row is None:
+        session.add(Config(key=key, value=value))
+    else:
+        row.value = value
+    session.commit()
 
 
-def get_int(conn: sqlite3.Connection, key: str) -> int:
-    return int(get(conn, key))
+def get_int(session: Session, key: str) -> int:
+    return int(get(session, key))
 
 
-def get_float(conn: sqlite3.Connection, key: str) -> float:
-    return float(get(conn, key))
+def get_float(session: Session, key: str) -> float:
+    return float(get(session, key))

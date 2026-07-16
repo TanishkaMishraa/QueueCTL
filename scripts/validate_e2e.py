@@ -71,7 +71,8 @@ def scenario_1_basic_completion(tmp_dir):
         )
         assert ok, "job1 did not reach 'completed' state"
     finally:
-        run_cli("worker", "stop", env=env)
+        stop_out = run_cli("worker", "stop", env=env).stdout
+        assert "1 confirmed stopped" in stop_out, f"worker did not confirm graceful stop in time: {stop_out!r}"
     return "Basic job completes successfully"
 
 
@@ -120,7 +121,8 @@ def scenario_3_parallel_workers_no_duplicates(tmp_dir):
         )
         assert not dupe_rows, f"jobs executed more than once: {[r['job_id'] for r in dupe_rows]}"
     finally:
-        run_cli("worker", "stop", env=env)
+        stop_out = run_cli("worker", "stop", env=env).stdout
+        assert "4 confirmed stopped" in stop_out, f"not all 4 workers confirmed graceful stop: {stop_out!r}"
     return "Multiple workers process jobs without overlap"
 
 

@@ -22,7 +22,8 @@ pip install -e ".[dev]"
 ```
 
 This installs a `queuectl` console command (via the `pyproject.toml`
-entry point) backed by `click`. `pytest` is installed as a dev dependency.
+entry point) backed by `click` for the CLI and `SQLAlchemy` as the ORM over
+SQLite. `pytest` is installed as a dev dependency.
 
 By default, job/worker/config state lives in `./queuectl_data/queuectl.db`
 (created on first use, relative to the current working directory). Override
@@ -52,9 +53,9 @@ Total jobs: 2
 Attempts logged: 3  Success rate: 33.3%
 
 Workers:
-  3f9a1c2b4d5e   pid=41232   status=running  current_job=-              last_heartbeat=2026-07-16T10:02:11.123456Z
-  7b2e8f1a9c3d   pid=41233   status=running  current_job=-              last_heartbeat=2026-07-16T10:02:11.201112Z
-  0d4f6a2e8b1c   pid=41234   status=running  current_job=-              last_heartbeat=2026-07-16T10:02:11.302981Z
+  3f9a1c2b4d5e   pid=41232   status=running  current_job=-              last_heartbeat=2026-07-16 10:02:11.123456
+  7b2e8f1a9c3d   pid=41233   status=running  current_job=-              last_heartbeat=2026-07-16 10:02:11.201112
+  0d4f6a2e8b1c   pid=41234   status=running  current_job=-              last_heartbeat=2026-07-16 10:02:11.302981
 
 $ queuectl list --state completed
 job1           completed  attempts=1/3   prio=0   cmd='echo Hello World'
@@ -102,52 +103,84 @@ All commands support `--help`.
 
 ## 3. Architecture overview
 
+**Layering**: `cli.py` (Click commands) → `queue_ops.py` / `config.py`
+(business logic, operating on a SQLAlchemy `Session`) → `models.py`
+(declarative ORM models) → `database.py` (engine + session factory) →
+SQLite. Each layer has one job: the CLI parses args and formats output,
+`queue_ops.py` owns every state transition, `models.py` is pure schema, and
+`database.py` is the only place that knows about SQLite/SQLAlchemy wiring.
+
 **Job lifecycle**: `pending` → `processing` → `completed` | `failed` → (`pending` again, after backoff) | `dead`.
 
 - `pending`: eligible to be claimed by any worker.
 - `processing`: claimed by exactly one worker, currently executing.
 - `completed`: exit code 0.
-- `failed`: exit code non-zero, retries remain; `next_attempt_at` set to `now + backoff_base^attempts`.
+- `failed`: exit code non-zero, retries remain; `next_retry` set to `now + backoff_base^attempts`.
 - `dead`: exit code non-zero, retries exhausted (`attempts >= max_retries`) — this **is** the DLQ; there's no separate table, just a `state='dead'` filter, so `dlq list`/`dlq retry` are thin wrappers over the same `jobs` table.
 
 **Data persistence**: a single SQLite database (`queuectl_data/queuectl.db`
-by default) in WAL mode, with three tables:
-- `jobs` — the queue itself (see fields above, plus `priority`, `run_at` for
-  scheduled jobs, `timeout_seconds`, `worker_id`, `last_error`, timestamps).
-- `workers` — one row per worker process (`pid`, `status`, `stop_requested`,
-  `current_job_id`, heartbeat) so `status` and `worker stop` have something
-  to look at across separate CLI invocations.
-- `config` — key/value store for `max_retries`, `backoff_base`, etc., with
-  built-in defaults so the table can start empty.
-- `job_logs` — one row per execution attempt (stdout/stderr/exit
-  code/timing) — job output logging and the success-rate stat in `status`
-  are built directly from this table.
+by default) in WAL mode, modeled as four SQLAlchemy ORM classes in
+`models.py`:
+- `Job` (table `jobs`) — the queue itself: `id`, `command`, `state`,
+  `attempts`, `max_retries`, `created_at`, `updated_at`, `next_retry`, plus
+  bonus-feature columns `priority`, `run_at` (scheduled jobs),
+  `timeout_seconds`, `worker_id`, `last_error`.
+- `Config` (table `config`) — key/value store for `max_retries`,
+  `backoff_base`, etc., with built-in defaults in `config.py` so the table
+  can start empty.
+- `Worker` (table `workers`) — one row per worker process (`pid`, `status`,
+  `stop_requested`, `current_job_id`, heartbeat), so `status` and `worker
+  stop` have something to look at across separate CLI invocations. This
+  table isn't part of a minimal jobs+config schema, but the assignment
+  requires `status` to show active workers and `worker stop` to signal
+  them gracefully — both need somewhere durable to read/write across
+  process boundaries.
+- `JobLog` (table `job_logs`) — one row per execution attempt
+  (stdout/stderr/exit code/timing) — job output logging and the
+  success-rate stat in `status` are built directly from this table.
 
 **Worker logic & locking**: `queuectl worker start --count N` spawns N
 detached OS processes (`python -m queuectl.worker`), each running an
-independent poll loop against the same database file. Job claiming
-(`queue_ops.claim_job`) wraps the "find an eligible job" `SELECT` and the
-"mark it processing" `UPDATE` in a single `BEGIN IMMEDIATE` SQLite
-transaction. `BEGIN IMMEDIATE` takes the write lock up front, so SQLite
-serializes concurrent workers on this transaction — two workers can never
-select and claim the same row, which is the mechanism that prevents
-duplicate execution (verified in `tests/test_queue_ops.py::test_concurrent_claims_never_double_claim`
+independent poll loop against the same database file, each with its own
+SQLAlchemy `Session`. Job claiming (`queue_ops.claim_job`) does the "find
+an eligible job" query and the "mark it processing" update in a single
+transaction. Getting SQLite to actually take a write lock *before* that
+`SELECT` runs takes two `database.py` engine event hooks, because
+pysqlite's default driver behavior fights against it:
+- on `connect`, `dbapi_connection.isolation_level = None` disables
+  pysqlite's own implicit transaction handling;
+- on `begin`, we emit `BEGIN IMMEDIATE` ourselves.
+
+With that in place, every transaction on this engine opens with `BEGIN
+IMMEDIATE`, so two workers racing to claim a job are serialized by
+SQLite's write lock — neither can see the job as free once the other has
+claimed it. This is the mechanism that prevents duplicate execution
+(verified in `tests/test_queue_ops.py::test_concurrent_claims_never_double_claim`
 with 8 threads racing over 20 jobs, and end-to-end in
-`scripts/validate_e2e.py` with 4 real worker processes over 20 jobs).
+`scripts/validate_e2e.py` with 4 real worker processes over 20 jobs). The
+trade-off: because *every* transaction takes the write lock, not just
+writes, a loop that reads via the ORM without committing between
+iterations will hold that lock indefinitely and block other processes —
+`worker_manager.stop_workers`'s polling loop commits after every read for
+exactly this reason (see design.md).
 
 **Graceful shutdown**: `worker stop` doesn't send OS signals (which behave
 inconsistently across platforms, especially Windows) — it sets a
-per-worker `stop_requested` flag in the `workers` table. Each worker only
+per-worker `stop_requested` flag on that `Worker` row. Each worker only
 checks that flag *between* jobs, never mid-execution, so a job that's
-already running is always allowed to finish. `worker stop` polls the table
-until workers report `status='stopped'` (or a timeout elapses). A
-`--foreground` worker also responds to Ctrl+C the same way, via a signal
-handler that sets the same in-loop stop condition.
+already running is always allowed to finish. Because the worker's
+SQLAlchemy session expires all objects on commit by default, re-reading
+`worker_row.stop_requested` after any commit transparently re-queries the
+database, so a flag set by a different process is picked up on the very
+next loop iteration. `worker stop` polls the table until workers report
+`status='stopped'` (or a timeout elapses). A `--foreground` worker also
+responds to Ctrl+C the same way, via a signal handler that sets the same
+in-loop stop condition.
 
 **Retry & backoff**: on failure, `attempts` increments and, if retries
-remain, the job goes to `failed` with `next_attempt_at = now +
-backoff_base ** attempts` seconds. The claim query treats `pending` jobs
-and `failed` jobs whose `next_attempt_at` has elapsed as equally eligible —
+remain, the job goes to `failed` with `next_retry = now +
+backoff_base ** attempts`. The claim query treats `pending` jobs
+and `failed` jobs whose `next_retry` has elapsed as equally eligible —
 so there's no separate scheduler/reaper process needed to "wake up" failed
 jobs.
 
@@ -164,6 +197,15 @@ and treated as an ordinary failure (retryable like any other).
   (`BEGIN IMMEDIATE`) for free, which is exactly what's needed to prevent
   duplicate job claims across worker processes. A hand-rolled JSON + file
   lock would need to reimplement the same guarantee less reliably.
+- **SQLAlchemy ORM over raw `sqlite3`**: models are declarative Python
+  classes (`Job`, `Config`, `Worker`, `JobLog` in `models.py`) instead of
+  hand-written SQL strings, which keeps `queue_ops.py` readable as plain
+  attribute access (`job.state = State.DEAD`) and keeps schema changes to
+  one place. The one place this costs extra care is the claim-locking
+  guarantee above: SQLAlchemy's default SQLite driver behavior doesn't
+  naturally support `BEGIN IMMEDIATE`, so `database.py` has to disable
+  pysqlite's implicit transactions and re-emit it manually via engine
+  events (documented inline there and in design.md).
 - **Workers are separate OS processes, not threads**: this mirrors how a
   real job queue would be deployed (independent, crash-isolated workers)
   and sidesteps the GIL for CPU-bound job commands; the cost is that

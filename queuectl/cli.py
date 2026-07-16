@@ -3,14 +3,14 @@ import json
 import click
 
 from . import config as config_mod
-from . import db
+from . import database
 from . import queue_ops
 from . import worker_manager
 from .models import State
 
 
-def _conn():
-    return db.connect()
+def _session():
+    return database.get_session()
 
 
 def _job_row(job) -> str:
@@ -40,14 +40,15 @@ def enqueue(job_json):
     if not isinstance(data, dict):
         raise click.ClickException("Job payload must be a JSON object")
 
-    conn = _conn()
+    session = _session()
     try:
-        job = queue_ops.enqueue_job(conn, data)
+        job = queue_ops.enqueue_job(session, data)
+        message = f"Enqueued job {job.id} (state={job.state}, max_retries={job.max_retries})"
     except ValueError as exc:
         raise click.ClickException(str(exc))
     finally:
-        conn.close()
-    click.echo(f"Enqueued job {job.id} (state={job.state}, max_retries={job.max_retries})")
+        session.close()
+    click.echo(message)
 
 
 @main.group()
@@ -84,11 +85,16 @@ def worker_stop(timeout):
 @main.command()
 def status():
     """Show summary of all job states & active workers."""
-    conn = _conn()
+    session = _session()
     try:
-        summary = queue_ops.status_summary(conn)
+        summary = queue_ops.status_summary(session)
+        worker_lines = [
+            f"  {w.worker_id:<14} pid={w.pid:<8} status={w.status:<8} "
+            f"current_job={(w.current_job_id or '-'):<14} last_heartbeat={w.last_heartbeat}"
+            for w in summary["workers"]
+        ]
     finally:
-        conn.close()
+        session.close()
 
     click.echo(f"Total jobs: {summary['jobs_total']}")
     for state in State.ALL:
@@ -98,14 +104,10 @@ def status():
                f"Success rate: {summary['success_rate_pct']}%")
 
     click.echo("\nWorkers:")
-    if not summary["workers"]:
+    if not worker_lines:
         click.echo("  (none)")
-    for w in summary["workers"]:
-        job = w["current_job_id"] or "-"
-        click.echo(
-            f"  {w['worker_id']:<14} pid={w['pid']:<8} status={w['status']:<8} "
-            f"current_job={job:<14} last_heartbeat={w['last_heartbeat']}"
-        )
+    for line in worker_lines:
+        click.echo(line)
 
 
 @main.command("list")
@@ -113,16 +115,17 @@ def status():
 @click.option("--limit", default=None, type=int, help="Limit number of results.")
 def list_cmd(state, limit):
     """List jobs, optionally filtered by state."""
-    conn = _conn()
+    session = _session()
     try:
-        jobs = queue_ops.list_jobs(conn, state=state, limit=limit)
+        jobs = queue_ops.list_jobs(session, state=state, limit=limit)
+        lines = [_job_row(job) for job in jobs]
     finally:
-        conn.close()
-    if not jobs:
+        session.close()
+    if not lines:
         click.echo("No jobs found.")
         return
-    for job in jobs:
-        click.echo(_job_row(job))
+    for line in lines:
+        click.echo(line)
 
 
 @main.group()
@@ -133,31 +136,33 @@ def dlq():
 @dlq.command("list")
 def dlq_list_cmd():
     """List jobs that permanently failed (moved to the DLQ)."""
-    conn = _conn()
+    session = _session()
     try:
-        jobs = queue_ops.dlq_list(conn)
+        jobs = queue_ops.dlq_list(session)
+        lines = [f"{_job_row(job)} last_error={job.last_error!r}" for job in jobs]
     finally:
-        conn.close()
-    if not jobs:
+        session.close()
+    if not lines:
         click.echo("DLQ is empty.")
         return
-    for job in jobs:
-        click.echo(f"{_job_row(job)} last_error={job.last_error!r}")
+    for line in lines:
+        click.echo(line)
 
 
 @dlq.command("retry")
 @click.argument("job_id")
 def dlq_retry_cmd(job_id):
     """Move a DLQ job back to pending for another attempt."""
-    conn = _conn()
+    session = _session()
     try:
         try:
-            job = queue_ops.dlq_retry(conn, job_id)
+            job = queue_ops.dlq_retry(session, job_id)
+            message = f"Job {job.id} requeued (state={job.state})"
         except (KeyError, ValueError) as exc:
             raise click.ClickException(str(exc))
     finally:
-        conn.close()
-    click.echo(f"Job {job.id} requeued (state={job.state})")
+        session.close()
+    click.echo(message)
 
 
 @main.group()
@@ -170,11 +175,11 @@ def config():
 @click.argument("value")
 def config_set(key, value):
     """Set a configuration value, e.g. queuectl config set max-retries 3"""
-    conn = _conn()
+    session = _session()
     try:
-        config_mod.set(conn, key.replace("-", "_"), value)
+        config_mod.set(session, key.replace("-", "_"), value)
     finally:
-        conn.close()
+        session.close()
     click.echo(f"Set {key} = {value}")
 
 
@@ -182,30 +187,30 @@ def config_set(key, value):
 @click.argument("key", required=False)
 def config_get(key):
     """Get one configuration value, or all if no key is given."""
-    conn = _conn()
+    session = _session()
     try:
         if key:
             try:
-                value = config_mod.get(conn, key.replace("-", "_"))
+                value = config_mod.get(session, key.replace("-", "_"))
             except KeyError as exc:
                 raise click.ClickException(str(exc))
             click.echo(f"{key} = {value}")
         else:
-            for k, v in config_mod.get_all(conn).items():
+            for k, v in config_mod.get_all(session).items():
                 click.echo(f"{k} = {v}")
     finally:
-        conn.close()
+        session.close()
 
 
 @config.command("list")
 def config_list():
     """List all configuration values."""
-    conn = _conn()
+    session = _session()
     try:
-        for k, v in config_mod.get_all(conn).items():
+        for k, v in config_mod.get_all(session).items():
             click.echo(f"{k} = {v}")
     finally:
-        conn.close()
+        session.close()
 
 
 if __name__ == "__main__":

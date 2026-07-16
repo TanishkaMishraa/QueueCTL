@@ -4,7 +4,8 @@ import sys
 import time
 from typing import List
 
-from . import db
+from . import database
+from .models import Worker
 from .utils import new_id
 
 
@@ -45,28 +46,31 @@ def start_workers(count: int, foreground: bool = False) -> List[str]:
 
 
 def stop_workers(timeout: float = 10.0) -> dict:
-    conn = db.connect()
+    session = database.get_session()
     try:
-        running = conn.execute("SELECT worker_id FROM workers WHERE status = 'running'").fetchall()
-        worker_ids = [row["worker_id"] for row in running]
+        running = session.query(Worker).filter(Worker.status == "running").all()
+        worker_ids = [w.worker_id for w in running]
         if not worker_ids:
             return {"requested": 0, "stopped": 0, "worker_ids": []}
 
-        for worker_id in worker_ids:
-            conn.execute("UPDATE workers SET stop_requested = 1 WHERE worker_id = ?", (worker_id,))
+        for w in running:
+            w.stop_requested = True
+        session.commit()
 
-        placeholders = ",".join("?" * len(worker_ids))
         deadline = time.monotonic() + timeout
         stopped: set = set()
         while time.monotonic() < deadline and len(stopped) < len(worker_ids):
-            rows = conn.execute(
-                f"SELECT worker_id, status FROM workers WHERE worker_id IN ({placeholders})",
-                worker_ids,
-            ).fetchall()
-            stopped = {row["worker_id"] for row in rows if row["status"] == "stopped"}
+            rows = session.query(Worker).filter(Worker.worker_id.in_(worker_ids)).all()
+            stopped = {w.worker_id for w in rows if w.status == "stopped"}
+            # Every transaction on this engine opens with BEGIN IMMEDIATE
+            # (see database.py), including this read-only check. Committing
+            # immediately releases that write lock between polls -- without
+            # it, this loop would hold the lock for its entire duration and
+            # starve the very worker processes it's waiting to see commit.
+            session.commit()
             if len(stopped) < len(worker_ids):
                 time.sleep(0.2)
 
         return {"requested": len(worker_ids), "stopped": len(stopped), "worker_ids": worker_ids}
     finally:
-        conn.close()
+        session.close()

@@ -1,6 +1,6 @@
 import pytest
 
-from queuectl import db as db_mod
+from queuectl import database
 
 
 @pytest.fixture
@@ -11,7 +11,7 @@ def db_path(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def conn(db_path):
-    connection = db_mod.connect(db_path)
-    yield connection
-    connection.close()
+def session(db_path):
+    s = database.get_session(db_path)
+    yield s
+    s.close()

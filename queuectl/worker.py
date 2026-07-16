@@ -12,10 +12,11 @@ import sys
 import time
 
 from . import config as config_mod
-from . import db
+from . import database
 from . import queue_ops
 from .execution import run_command
-from .utils import new_id, now_iso
+from .models import Worker
+from .utils import new_id, utcnow
 
 _stop_requested = False
 
@@ -33,66 +34,62 @@ def _register_signal_handlers():
         pass
 
 
-def _db_stop_requested(conn, worker_id: str) -> bool:
-    row = conn.execute(
-        "SELECT stop_requested FROM workers WHERE worker_id = ?", (worker_id,)
-    ).fetchone()
-    return bool(row and row["stop_requested"])
-
-
 def run(worker_id: str = None) -> None:
     _register_signal_handlers()
-    conn = db.connect()
+    session = database.get_session()
     worker_id = worker_id or new_id()
-    pid = os.getpid()
-    now = now_iso()
+    now = utcnow()
 
-    conn.execute(
-        """
-        INSERT INTO workers (worker_id, pid, status, stop_requested, current_job_id, started_at, last_heartbeat)
-        VALUES (?, ?, 'running', 0, NULL, ?, ?)
-        """,
-        (worker_id, pid, now, now),
+    worker_row = Worker(
+        worker_id=worker_id,
+        pid=os.getpid(),
+        status="running",
+        stop_requested=False,
+        current_job_id=None,
+        started_at=now,
+        last_heartbeat=now,
     )
+    session.add(worker_row)
+    session.commit()
 
     try:
-        while not _stop_requested and not _db_stop_requested(conn, worker_id):
-            poll_interval = config_mod.get_float(conn, "poll_interval")
-            backoff_base = config_mod.get_float(conn, "backoff_base")
+        # Each loop iteration re-reads worker_row.stop_requested: the
+        # session's expire-on-commit behaviour means this is a fresh read
+        # from the database every time, so a stop_requested flag set by a
+        # different process (`worker stop`) is picked up promptly.
+        while not _stop_requested and not worker_row.stop_requested:
+            poll_interval = config_mod.get_float(session, "poll_interval")
+            backoff_base = config_mod.get_float(session, "backoff_base")
 
-            job = queue_ops.claim_job(conn, worker_id)
+            job = queue_ops.claim_job(session, worker_id)
             if job is None:
-                conn.execute(
-                    "UPDATE workers SET last_heartbeat = ? WHERE worker_id = ?",
-                    (now_iso(), worker_id),
-                )
+                worker_row.last_heartbeat = utcnow()
+                session.commit()
                 time.sleep(poll_interval)
                 continue
 
-            conn.execute(
-                "UPDATE workers SET current_job_id = ?, last_heartbeat = ? WHERE worker_id = ?",
-                (job.id, now_iso(), worker_id),
-            )
+            worker_row.current_job_id = job.id
+            worker_row.last_heartbeat = utcnow()
+            session.commit()
 
-            started_at = now_iso()
+            started_at = utcnow()
             result = run_command(job.command, job.timeout_seconds)
 
             if result.exit_code == 0:
-                queue_ops.complete_job(conn, job, result, started_at)
+                queue_ops.complete_job(session, job, result, started_at)
             else:
-                queue_ops.fail_job(conn, job, result, started_at, backoff_base)
+                queue_ops.fail_job(session, job, result, started_at, backoff_base)
 
-            conn.execute(
-                "UPDATE workers SET current_job_id = NULL, last_heartbeat = ? WHERE worker_id = ?",
-                (now_iso(), worker_id),
-            )
+            worker_row.current_job_id = None
+            worker_row.last_heartbeat = utcnow()
+            session.commit()
     finally:
-        conn.execute(
-            "UPDATE workers SET status = 'stopped', stop_requested = 0, current_job_id = NULL, "
-            "last_heartbeat = ? WHERE worker_id = ?",
-            (now_iso(), worker_id),
-        )
-        conn.close()
+        worker_row.status = "stopped"
+        worker_row.stop_requested = False
+        worker_row.current_job_id = None
+        worker_row.last_heartbeat = utcnow()
+        session.commit()
+        session.close()
 
 
 if __name__ == "__main__":
