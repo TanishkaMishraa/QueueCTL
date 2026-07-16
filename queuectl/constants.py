@@ -19,3 +19,9 @@ DEFAULT_TIMEOUT = 30
 DEFAULT_PRIORITY = 0
 DEFAULT_POLL_INTERVAL = 1
 DEFAULT_HEARTBEAT_INTERVAL = 2
+
+# A worker whose last_heartbeat is older than this is considered dead/stuck
+# (crashed, killed, hung) even though its `workers` row still says
+# status='running' -- nothing marks it stopped, since that only happens in
+# the worker's own shutdown code, which a crash never reaches.
+HEARTBEAT_STALE_SECONDS = 30

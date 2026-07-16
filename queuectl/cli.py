@@ -6,11 +6,15 @@ from rich.panel import Panel
 from rich.table import Table
 
 from . import config as config_mod
+from . import constants
 from . import database
+from . import dlq as dlq_mod
 from . import queue_ops
 from . import worker_manager
 from .exceptions import JobNotFoundError, QueueCTLError
 from .models import State
+from .utils import utcnow
+from .worker_logging import get_worker_logger
 
 # Fixed width avoids Rich wrapping/truncating output differently depending
 # on whether stdout is a real terminal, a pipe, or captured by tests.
@@ -37,6 +41,19 @@ def _parse_priority(value):
         raise click.ClickException(
             f"Invalid --priority {value!r}: use an integer, or one of low/normal/high"
         )
+
+
+def _format_worker_line(w) -> str:
+    age_seconds = (utcnow() - w.last_heartbeat).total_seconds()
+    stale = w.status == "running" and age_seconds > constants.HEARTBEAT_STALE_SECONDS
+    job = w.current_job_id or "-"
+    line = (
+        f"  {w.worker_id:<14} pid={w.pid:<8} status={w.status:<8} "
+        f"current_job={job:<14} heartbeat={age_seconds:.0f}s ago"
+    )
+    if stale:
+        line += "  [STALE - no heartbeat, likely crashed]"
+    return line
 
 
 def _job_row(job) -> str:
@@ -179,17 +196,31 @@ def worker_stop(timeout):
         click.echo("Some workers did not confirm within the timeout; they will stop after their current job.")
 
 
+@worker.command("list")
+def worker_list_cmd():
+    """List worker processes and their status (a focused view of what `status` also shows)."""
+    session = _session()
+    try:
+        workers = queue_ops.list_workers(session)
+        lines = [_format_worker_line(w) for w in workers]
+        running_count = sum(1 for w in workers if w.status == "running")
+    finally:
+        session.close()
+    click.echo(f"Workers Running: {running_count}")
+    if not lines:
+        click.echo("  (none)")
+    for line in lines:
+        click.echo(line)
+
+
 @main.command()
 def status():
     """Show summary of all job states & active workers."""
     session = _session()
     try:
         summary = queue_ops.status_summary(session)
-        worker_lines = [
-            f"  {w.worker_id:<14} pid={w.pid:<8} status={w.status:<8} "
-            f"current_job={(w.current_job_id or '-'):<14} last_heartbeat={w.last_heartbeat}"
-            for w in summary["workers"]
-        ]
+        worker_lines = [_format_worker_line(w) for w in summary["workers"]]
+        running_count = sum(1 for w in summary["workers"] if w.status == "running")
     finally:
         session.close()
 
@@ -200,7 +231,7 @@ def status():
     click.echo(f"\nAttempts logged: {summary['total_attempts_logged']}  "
                f"Success rate: {summary['success_rate_pct']}%")
 
-    click.echo("\nWorkers:")
+    click.echo(f"\nWorkers Running: {running_count}")
     if not worker_lines:
         click.echo("  (none)")
     for line in worker_lines:
@@ -268,7 +299,7 @@ def job_delete(job_id, yes):
 
 @main.group()
 def dlq():
-    """View or retry Dead Letter Queue jobs."""
+    """View, count, retry, or delete Dead Letter Queue jobs."""
 
 
 @dlq.command("list")
@@ -276,7 +307,7 @@ def dlq_list_cmd():
     """List jobs that permanently failed (moved to the DLQ)."""
     session = _session()
     try:
-        jobs = queue_ops.dlq_list(session)
+        jobs = dlq_mod.list_dead_jobs(session)
         lines = [f"{_job_row(job)} last_error={job.last_error!r}" for job in jobs]
     finally:
         session.close()
@@ -287,6 +318,17 @@ def dlq_list_cmd():
         click.echo(line)
 
 
+@dlq.command("count")
+def dlq_count_cmd():
+    """Show how many jobs are currently in the DLQ."""
+    session = _session()
+    try:
+        count = dlq_mod.count_dead_jobs(session)
+    finally:
+        session.close()
+    click.echo(f"Dead Jobs: {count}")
+
+
 @dlq.command("retry")
 @click.argument("job_id")
 def dlq_retry_cmd(job_id):
@@ -294,13 +336,34 @@ def dlq_retry_cmd(job_id):
     session = _session()
     try:
         try:
-            job = queue_ops.dlq_retry(session, job_id)
+            job = dlq_mod.retry_dead_job(session, job_id)
             message = f"Job {job.id} requeued (state={job.state})"
         except QueueCTLError as exc:
             raise click.ClickException(str(exc))
     finally:
         session.close()
+    get_worker_logger().info(f"[cli] Job {job_id} manually retried from DLQ")
     click.echo(message)
+
+
+@dlq.command("delete")
+@click.argument("job_id")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
+def dlq_delete_cmd(job_id, yes):
+    """Permanently delete a job from the DLQ."""
+    session = _session()
+    try:
+        if not yes and not click.confirm(f"Delete job {job_id} permanently?", default=False):
+            click.echo("Aborted.")
+            return
+        try:
+            dlq_mod.delete_dead_job(session, job_id)
+        except QueueCTLError as exc:
+            raise click.ClickException(str(exc))
+    finally:
+        session.close()
+    get_worker_logger().info(f"[cli] Job {job_id} deleted from DLQ")
+    click.echo(f"Deleted job {job_id}")
 
 
 @main.group()

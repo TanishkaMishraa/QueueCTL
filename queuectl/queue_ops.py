@@ -77,6 +77,13 @@ def get_pending_jobs(session: Session, limit: Optional[int] = None) -> List[Job]
     return list_jobs(session, state=State.PENDING, limit=limit)
 
 
+def count_jobs(session: Session, state: Optional[str] = None) -> int:
+    query = session.query(func.count(Job.id))
+    if state:
+        query = query.filter(Job.state == state)
+    return query.scalar() or 0
+
+
 _UPDATABLE_FIELDS = {
     "command": validators.validate_command,
     "max_retries": validators.validate_max_retries,
@@ -196,6 +203,13 @@ def complete_job(session: Session, job: Job, result: ExecutionResult, started_at
 
 
 def fail_job(session: Session, job: Job, result: ExecutionResult, started_at, backoff_base: float) -> None:
+    """Record a failed execution attempt and decide what happens next:
+    schedule a retry, or move the job to the DLQ (state='dead') if
+    retry.is_dead says attempts are exhausted. This is the only code path
+    that can create a dead job -- there's no separate move_to_dlq(job_id)
+    entry point, since "died as a direct result of this failed attempt"
+    is one atomic transition, not two calls a caller could get out of
+    sync."""
     now = utcnow()
     job.attempts += 1
     reason = result.stderr.strip() or result.stdout.strip() or f"exit code {result.exit_code}"
@@ -234,12 +248,16 @@ def dlq_retry(session: Session, job_id: str) -> Job:
     return job
 
 
+def list_workers(session: Session) -> List[Worker]:
+    return session.query(Worker).order_by(Worker.started_at).all()
+
+
 def status_summary(session: Session) -> dict:
     counts = {s: 0 for s in State.ALL}
     for state, count in session.query(Job.state, func.count(Job.id)).group_by(Job.state).all():
         counts[state] = count
 
-    workers = session.query(Worker).order_by(Worker.started_at).all()
+    workers = list_workers(session)
 
     total_attempts = session.query(func.count(JobLog.id)).scalar() or 0
     successes = session.query(func.count(JobLog.id)).filter(JobLog.exit_code == 0).scalar() or 0

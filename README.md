@@ -62,10 +62,17 @@ Total jobs: 2
 
 Attempts logged: 3  Success rate: 33.3%
 
-Workers:
-  3f9a1c2b4d5e   pid=41232   status=running  current_job=-              last_heartbeat=2026-07-16 10:02:11.123456
-  7b2e8f1a9c3d   pid=41233   status=running  current_job=-              last_heartbeat=2026-07-16 10:02:11.201112
-  0d4f6a2e8b1c   pid=41234   status=running  current_job=-              last_heartbeat=2026-07-16 10:02:11.302981
+Workers Running: 3
+  3f9a1c2b4d5e   pid=41232   status=running  current_job=-              heartbeat=1s ago
+  7b2e8f1a9c3d   pid=41233   status=running  current_job=-              heartbeat=1s ago
+  0d4f6a2e8b1c   pid=41234   status=running  current_job=-              heartbeat=2s ago
+
+$ queuectl worker list
+# ...some time later, after one worker process was killed/crashed:
+Workers Running: 3
+  3f9a1c2b4d5e   pid=41232   status=running  current_job=-              heartbeat=3s ago
+  7b2e8f1a9c3d   pid=41233   status=running  current_job=-              heartbeat=3s ago
+  0d4f6a2e8b1c   pid=41234   status=running  current_job=-              heartbeat=47s ago  [STALE - no heartbeat, likely crashed]
 
 $ queuectl list --state completed
 +-----------------------------------------------------------------+
@@ -93,8 +100,15 @@ Deleted job job2
 $ queuectl dlq list
 a1b2c3d4e5f6   dead       attempts=2/2   prio=0   cmd='exit 1' last_error='exit code 1'
 
+$ queuectl dlq count
+Dead Jobs: 1
+
 $ queuectl dlq retry a1b2c3d4e5f6
 Job a1b2c3d4e5f6 requeued (state=pending)
+
+$ queuectl dlq delete a1b2c3d4e5f6
+Delete job a1b2c3d4e5f6 permanently? [y/N]: y
+Deleted job a1b2c3d4e5f6
 
 $ queuectl config set max-retries 5
 Set max-retries = 5
@@ -133,12 +147,15 @@ e.g. `python -c "import time; time.sleep(2)"` or PowerShell's
 | `queuectl enqueue '<json>'` | Same command, JSON form — matches the assignment's original example (`{"id":"job1","command":"sleep 2"}`). Detected automatically: if the argument starts with `{` it's parsed as JSON, otherwise it's treated as a literal command. |
 | `queuectl worker start --count N [--foreground]` | Start N worker processes (detached background by default; `--foreground` runs a single worker in this terminal, Ctrl+C to stop). |
 | `queuectl worker stop [--timeout SEC]` | Ask all running workers to finish their current job and exit; waits up to `--timeout` seconds for confirmation. |
+| `queuectl worker list` | List worker processes with PID, status, current job, and heartbeat age; flags any with a stale heartbeat. A focused view of what `status` also shows. |
 | `queuectl status` | Job counts by state, attempt/success stats, and active worker list. |
 | `queuectl list [--state STATE] [--limit N]` | List jobs (Rich table), optionally filtered by state. |
 | `queuectl job show <job_id>` | Show full details for one job (command, state, attempts, timestamps, last error). |
 | `queuectl job delete <job_id> [--yes]` | Delete a job permanently; prompts for confirmation unless `--yes`/`-y` is given. |
 | `queuectl dlq list` | List jobs in the Dead Letter Queue. |
-| `queuectl dlq retry <job_id>` | Reset a DLQ job back to `pending` (attempts reset to 0). |
+| `queuectl dlq count` | Show how many jobs are currently in the DLQ. |
+| `queuectl dlq retry <job_id>` | Reset a DLQ job back to `pending` (attempts and `next_retry` cleared). |
+| `queuectl dlq delete <job_id> [--yes]` | Permanently delete a job, but only if it's actually in the DLQ; prompts for confirmation unless `--yes`/`-y`. Rejects a job that isn't dead (use `queuectl job delete` for that). |
 | `queuectl config set/get/list/reset` | Manage `max-retries`, `backoff-base`, `poll-interval`, `heartbeat-interval`, `timeout`. `reset [key]` restores one key (or all, if omitted) back to its default. |
 
 All commands support `--help`.
@@ -208,6 +225,28 @@ base class and print a clean message instead of leaking a raw
 - `completed`: exit code 0.
 - `failed`: exit code non-zero, retries remain; `next_retry` set to `now + backoff_base^attempts`.
 - `dead`: exit code non-zero, retries exhausted (`attempts >= max_retries`) — this **is** the DLQ; there's no separate table, just a `state='dead'` filter, so `dlq list`/`dlq retry` are thin wrappers over the same `jobs` table.
+
+**Dead Letter Queue** (`dlq.py`): `list_dead_jobs`, `count_dead_jobs`,
+`retry_dead_job`, `delete_dead_job` — a dedicated namespace for DLQ
+operations, matching how `cli.py`'s `dlq` command group calls them (`dlq
+list` → `list_dead_jobs`, `dlq count` → `count_dead_jobs`, etc.). None of
+these functions write their own queries, though: `dlq.py` delegates to
+`queue_ops.py` (via `list_jobs`, `count_jobs`, `dlq_retry`, `get_job` +
+`delete_job`) rather than becoming a second module that talks to
+`Session` directly, so "the only module that writes ORM queries" stays
+true even with DLQ operations pulled into their own file. The one place
+`dlq.py` adds real logic beyond delegation is `delete_dead_job`, which
+checks `job.state == State.DEAD` before allowing the delete — unlike the
+generic `queuectl job delete` (any state), `queuectl dlq delete` refuses
+to touch a job that isn't actually in the DLQ. A job never reaches `dead`
+except through `queue_ops.fail_job` deciding `retry.is_dead(...)` is true
+— there's no separate `move_to_dlq(job_id)` entry point, since "died as a
+direct result of this failed attempt" is one atomic transition (update
+state + store the error + log the attempt + commit), not two calls a
+caller could invoke out of order or forget to pair up. Both `dlq retry`
+and `dlq delete` append an event to `logs/worker.log` (manually retried /
+deleted from DLQ), alongside the automatic "exceeded retries, moved to
+DLQ" event a worker logs when it happens.
 
 **Data persistence**: a single SQLite database (`queuectl_data/queuectl.db`
 by default) in WAL mode, modeled as four SQLAlchemy ORM classes in
@@ -306,6 +345,28 @@ next loop iteration. `worker stop` polls the table until workers report
 `status='stopped'` (or a timeout elapses). A `--foreground` worker also
 responds to Ctrl+C the same way, via a signal handler that sets the same
 in-loop stop condition.
+
+**Crash resilience & heartbeat staleness**: workers are independent OS
+processes with no supervisor watching them, so one worker being killed
+(crash, forced termination, OOM, whatever) has zero effect on the others —
+each just keeps polling the shared database on its own. The trade-off is
+that a crashed worker's `workers` row is stuck at `status='running'`
+forever, since "mark myself stopped" is code that runs in the worker's own
+shutdown path, which a crash never reaches. That's what
+`constants.HEARTBEAT_STALE_SECONDS` (30s) is for: `queuectl status` and
+`queuectl worker list` compute each running worker's heartbeat age at
+display time and tag it `[STALE - no heartbeat, likely crashed]` once it
+exceeds that threshold, rather than trusting the possibly-stuck `status`
+column on its own. This is a purely computed, read-time flag — nothing
+writes it back to the database (a worker that was just slow, not dead,
+shouldn't have its row silently rewritten from a `status` read). Verified
+end-to-end in `scripts/validate_e2e.py`'s crash scenario: 12 jobs, 3
+workers, one worker force-killed mid-batch (`SIGKILL` on POSIX;
+`os.kill(pid, SIGTERM)` on Windows, which CPython maps directly to
+`TerminateProcess` — neither is deliverable to a signal handler, so it's
+a true crash, not a graceful shutdown) — the other two finish all 12 jobs
+with no job executed twice, and the killed worker's row is confirmed to
+still read `status='running'`.
 
 **Retry & backoff**: on failure, `attempts` increments and, if retries
 remain, the job goes to `failed` with `next_retry = now +
@@ -406,9 +467,12 @@ pytest
 ```
 
 End-to-end validation (spawns the real CLI and real worker processes,
-covering the assignment's 5 required scenarios: basic completion,
+covering the assignment's 5 required scenarios — basic completion,
 retry→backoff→DLQ, parallel workers with no duplicate execution, invalid
-commands failing gracefully, and persistence across a restart):
+commands failing gracefully, and persistence across a restart — plus 2
+supplementary ones: graceful shutdown actually waits for an in-flight job
+to finish, and force-killing one worker out of several doesn't stop the
+others or cause any job to run twice):
 
 ```bash
 python scripts/validate_e2e.py

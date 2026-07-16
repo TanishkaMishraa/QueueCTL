@@ -1,4 +1,7 @@
-"""End-to-end validation of the 5 required test scenarios from the assignment.
+"""End-to-end validation of the assignment's 5 required test scenarios,
+plus 2 supplementary ones covering graceful shutdown and crash resilience
+under concurrent workers (Phase 7's milestone 7.11: "shutdown" and
+"crash" test cases).
 
 Run with:  python scripts/validate_e2e.py
 
@@ -9,6 +12,7 @@ exercises the exact same code path a user would.
 import json
 import os
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -57,6 +61,18 @@ def make_env(db_path):
     env = dict(os.environ)
     env["QUEUECTL_DB"] = str(db_path)
     return env
+
+
+def force_kill(pid):
+    """Terminate a process the way a real crash would -- uncatchable, no
+    chance for the worker's own shutdown code to run. On POSIX that's
+    SIGKILL; os.kill(pid, SIGTERM) on Windows is handled specially by
+    CPython as a direct TerminateProcess call, which Python signal
+    handlers never see either, so it has the same effect there."""
+    if os.name == "nt":
+        os.kill(pid, signal.SIGTERM)
+    else:
+        os.kill(pid, signal.SIGKILL)
 
 
 def scenario_1_basic_completion(tmp_dir):
@@ -160,6 +176,79 @@ def scenario_5_persistence_across_restart(tmp_dir):
     return "Job data survives restart"
 
 
+def scenario_6_graceful_shutdown_waits_for_current_job(tmp_dir):
+    db_path = tmp_dir / "s6.db"
+    env = make_env(db_path)
+    cmd = f'{PYTHON} -c "import time; time.sleep(3)"'
+    run_cli("enqueue", json.dumps({"id": "job6", "command": cmd}), env=env)
+    run_cli("worker", "start", "--count", "1", env=env)
+    try:
+        picked_up = wait_until(
+            lambda: query_db(db_path, "SELECT state FROM jobs WHERE id='job6'")[0]["state"] == "processing",
+            timeout=10,
+        )
+        assert picked_up, "job6 was never claimed by the worker"
+
+        # Ask the worker to stop while job6 is still mid-sleep. A generous
+        # --timeout gives stop_workers room to actually observe the ~3s
+        # job finish, rather than giving up before it does.
+        stop_out = run_cli("worker", "stop", "--timeout", "15", env=env).stdout
+        assert "1 confirmed stopped" in stop_out, f"worker did not shut down gracefully: {stop_out!r}"
+
+        state = query_db(db_path, "SELECT state FROM jobs WHERE id='job6'")[0]["state"]
+        assert state == "completed", f"job6 should have finished before the worker stopped, got state={state!r}"
+    finally:
+        run_cli("worker", "stop", env=env)
+    return "Graceful shutdown finishes the in-flight job before the worker exits"
+
+
+def scenario_7_worker_crash_others_continue(tmp_dir):
+    db_path = tmp_dir / "s7.db"
+    env = make_env(db_path)
+    n_jobs = 12
+    # Each job takes a moment so there's an actual window to kill a
+    # worker mid-batch instead of after everything's already done.
+    cmd = f'{PYTHON} -c "import time; time.sleep(0.5)"'
+    for i in range(n_jobs):
+        run_cli("enqueue", json.dumps({"id": f"crash{i}", "command": cmd}), env=env)
+    run_cli("worker", "start", "--count", "3", env=env)
+    try:
+        got_workers = wait_until(
+            lambda: len(query_db(db_path, "SELECT pid FROM workers WHERE status='running'")) == 3,
+            timeout=20,
+        )
+        assert got_workers, "not all 3 workers registered in time"
+        victim = query_db(db_path, "SELECT worker_id, pid FROM workers WHERE status='running'")[0]
+        force_kill(victim["pid"])
+
+        ok = wait_until(
+            lambda: query_db(db_path, "SELECT COUNT(*) AS c FROM jobs WHERE state='completed'")[0]["c"] == n_jobs,
+            timeout=30,
+        )
+        assert ok, "surviving workers did not finish all jobs after one was killed"
+
+        dupe_rows = query_db(
+            db_path,
+            "SELECT job_id, COUNT(*) AS c FROM job_logs GROUP BY job_id HAVING c > 1",
+        )
+        assert not dupe_rows, f"jobs executed more than once: {[r['job_id'] for r in dupe_rows]}"
+
+        # A crash never runs the worker's own shutdown code (the only
+        # place a `workers` row is marked 'stopped'), so the killed
+        # worker's row should still read 'running' -- this is exactly
+        # why `status`'s heartbeat-staleness check exists.
+        victim_status = query_db(
+            db_path, "SELECT status FROM workers WHERE worker_id=?", (victim["worker_id"],)
+        )[0]["status"]
+        assert victim_status == "running", (
+            f"killed worker's row should still read 'running' (nothing marks it stopped on a "
+            f"crash) -- got {victim_status!r}"
+        )
+    finally:
+        run_cli("worker", "stop", "--timeout", "3", env=env)
+    return "Killing one worker doesn't stop the others, and no job runs twice"
+
+
 def main():
     tmp_dir = Path(tempfile.mkdtemp(prefix="queuectl_e2e_"))
     scenarios = [
@@ -168,6 +257,8 @@ def main():
         scenario_3_parallel_workers_no_duplicates,
         scenario_4_invalid_command_fails_gracefully,
         scenario_5_persistence_across_restart,
+        scenario_6_graceful_shutdown_waits_for_current_job,
+        scenario_7_worker_crash_others_continue,
     ]
     results = []
     try:
