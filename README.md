@@ -659,7 +659,7 @@ process alive, a long-running worker container needs `--foreground`:
 
 ## Demo
 
-<!-- Add the recorded CLI demo link here before submitting, per the assignment's Submission section. -->
+[Project demo video](https://drive.google.com/file/d/1aV68kVGea_eJX5e3vk5XoNoSCDns161z/view?usp=drive_link)
 
 ## Bonus features implemented
 
