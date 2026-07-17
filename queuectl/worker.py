@@ -17,8 +17,8 @@ from . import queue_ops
 from . import retry
 from .executor import run_command
 from .models import State, Worker
+from .app_logging import get_worker_logger
 from .utils import new_id, utcnow
-from .worker_logging import get_worker_logger
 
 _stop_requested = False
 
@@ -86,10 +86,12 @@ def run(worker_id: str = None) -> None:
             else:
                 queue_ops.fail_job(session, job, result, started_at, backoff_base)
                 if job.state == State.DEAD:
-                    logger.info(f"[{worker_id}] Job {job.id} exceeded retries ({job.attempts}/{job.max_retries}), moved to DLQ")
+                    # ERROR level: this is the event error.log exists to
+                    # surface -- a job has permanently failed.
+                    logger.error(f"[{worker_id}] Job {job.id} exceeded retries ({job.attempts}/{job.max_retries}), moved to DLQ")
                 else:
                     delay = retry.calculate_delay(job.attempts, backoff_base)
-                    logger.info(
+                    logger.warning(
                         f"[{worker_id}] Job {job.id} failed (attempt {job.attempts}/{job.max_retries}), "
                         f"retry in {delay:.0f}s"
                     )

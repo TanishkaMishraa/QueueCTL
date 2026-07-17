@@ -29,7 +29,9 @@ def create_job(session: Session, data: dict) -> Job:
     max_retries = validators.validate_max_retries(
         data.get("max_retries", config_mod.get_int(session, "max_retries"))
     )
-    priority = validators.validate_priority(data.get("priority", 0))
+    priority = validators.validate_priority(
+        data.get("priority", config_mod.get_int(session, "default_priority"))
+    )
     run_at = validators.validate_run_at(data.get("run_at"))
     timeout_seconds = validators.validate_timeout_seconds(data.get("timeout_seconds"))
     now = utcnow()
@@ -250,6 +252,10 @@ def dlq_retry(session: Session, job_id: str) -> Job:
 
 def list_workers(session: Session) -> List[Worker]:
     return session.query(Worker).order_by(Worker.started_at).all()
+
+
+def list_job_logs(session: Session) -> List[JobLog]:
+    return session.query(JobLog).order_by(JobLog.started_at.asc()).all()
 
 
 def status_summary(session: Session) -> dict:

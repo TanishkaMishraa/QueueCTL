@@ -1,4 +1,5 @@
 import json
+import sys
 
 import click
 from rich.console import Console
@@ -9,12 +10,13 @@ from . import config as config_mod
 from . import constants
 from . import database
 from . import dlq as dlq_mod
+from . import metrics as metrics_mod
 from . import queue_ops
 from . import worker_manager
 from .exceptions import JobNotFoundError, QueueCTLError
 from .models import State
 from .utils import utcnow
-from .worker_logging import get_worker_logger
+from .app_logging import get_app_logger
 
 # Fixed width avoids Rich wrapping/truncating output differently depending
 # on whether stdout is a real terminal, a pipe, or captured by tests.
@@ -43,15 +45,19 @@ def _parse_priority(value):
         )
 
 
+def _is_worker_stale(w) -> bool:
+    age_seconds = (utcnow() - w.last_heartbeat).total_seconds()
+    return w.status == "running" and age_seconds > constants.HEARTBEAT_STALE_SECONDS
+
+
 def _format_worker_line(w) -> str:
     age_seconds = (utcnow() - w.last_heartbeat).total_seconds()
-    stale = w.status == "running" and age_seconds > constants.HEARTBEAT_STALE_SECONDS
     job = w.current_job_id or "-"
     line = (
         f"  {w.worker_id:<14} pid={w.pid:<8} status={w.status:<8} "
         f"current_job={job:<14} heartbeat={age_seconds:.0f}s ago"
     )
-    if stale:
+    if _is_worker_stale(w):
         line += "  [STALE - no heartbeat, likely crashed]"
     return line
 
@@ -158,10 +164,12 @@ def enqueue(job_arg, job_id, priority, timeout_seconds, max_retries, run_at):
     try:
         job = queue_ops.create_job(session, data)
         panel = _job_created_panel(job)
+        job_id = job.id
     except QueueCTLError as exc:
         raise click.ClickException(str(exc))
     finally:
         session.close()
+    get_app_logger().info(f"Job {job_id} created (command={data.get('command')!r})")
     _console().print(panel)
 
 
@@ -175,6 +183,20 @@ def worker():
 @click.option("--foreground", is_flag=True, help="Run a single worker in the foreground (blocks; Ctrl+C to stop).")
 def worker_start(count, foreground):
     """Start one or more workers."""
+    session = _session()
+    try:
+        max_workers = config_mod.get_int(session, "max_workers")
+        running_now = sum(
+            1 for w in queue_ops.list_workers(session) if w.status == "running" and not _is_worker_stale(w)
+        )
+    finally:
+        session.close()
+    if running_now + count > max_workers:
+        raise click.ClickException(
+            f"Refusing to start {count} worker(s): {running_now} already running and "
+            f"max_workers={max_workers} (queuectl config set max-workers N to raise this)."
+        )
+
     try:
         worker_ids = worker_manager.start_workers(count, foreground=foreground)
     except ValueError as exc:
@@ -238,6 +260,119 @@ def status():
         click.echo(line)
 
 
+@main.command()
+def stats():
+    """Show job execution statistics: completed/failed/retries/DLQ counts, runtime, and rates."""
+    session = _session()
+    try:
+        m = metrics_mod.calculate_metrics(session)
+    finally:
+        session.close()
+
+    click.echo("Jobs Executed")
+    click.echo(f"  Completed : {m['completed_jobs']}")
+    click.echo(f"  Failed    : {m['failed_attempts']}")
+    click.echo(f"  Retries   : {m['retry_attempts']}")
+    click.echo(f"  DLQ       : {m['dead_jobs']}")
+
+    click.echo(f"\nAverage Runtime : {m['avg_runtime_seconds']:.2f} sec")
+    click.echo(f"Longest Runtime : {m['longest_runtime_seconds']:.2f} sec")
+    click.echo(f"Shortest Runtime: {m['shortest_runtime_seconds']:.2f} sec")
+
+    click.echo(f"\nSuccess Rate: {m['success_rate_pct']}%")
+    click.echo(f"Failure Rate: {m['failure_rate_pct']}%")
+    click.echo(f"Retry Rate  : {m['retry_rate_pct']}%")
+    click.echo(f"Throughput  : {m['throughput_per_hour']} jobs/hour")
+
+
+@main.command()
+def health():
+    """Check database connectivity, worker availability, queue accessibility, and configuration."""
+    try:
+        session = _session()
+    except Exception as exc:
+        click.echo("Database")
+        click.echo(f"  [FAIL] {exc}")
+        click.echo("\nWorkers\n  [FAIL] Unknown (database unreachable)")
+        click.echo("\nQueue\n  [FAIL] Not accessible")
+        click.echo("\nDLQ\n  [FAIL] Unknown")
+        click.echo("\nConfiguration\n  [FAIL] Not loaded")
+        sys.exit(1)
+
+    try:
+        workers = queue_ops.list_workers(session)
+        active_workers = [w for w in workers if w.status == "running" and not _is_worker_stale(w)]
+        config_values = config_mod.get_all(session)
+        dead_count = dlq_mod.count_dead_jobs(session)
+    finally:
+        session.close()
+
+    click.echo("Database")
+    click.echo("  [OK] Healthy")
+
+    click.echo("\nWorkers")
+    click.echo(f"  [OK] Running ({len(active_workers)} active)" if active_workers else "  [WARN] None running")
+
+    click.echo("\nQueue")
+    click.echo("  [OK] Accepting Jobs")
+
+    click.echo("\nDLQ")
+    click.echo(f"  {dead_count} Job(s)")
+
+    click.echo("\nConfiguration")
+    click.echo("  [OK] Loaded" if config_values else "  [WARN] Empty")
+
+
+@main.command()
+def dashboard():
+    """Rich multi-panel overview: queue stats, current workers, recent jobs, and DLQ health."""
+    session = _session()
+    try:
+        summary = queue_ops.status_summary(session)
+        workers = queue_ops.list_workers(session)
+        recent_jobs = queue_ops.list_jobs(session, limit=5)
+        dead_count = dlq_mod.count_dead_jobs(session)
+    finally:
+        session.close()
+
+    running_count = sum(1 for w in workers if w.status == "running")
+    stats_lines = "\n".join(
+        [
+            f"Pending      {summary['by_state'][State.PENDING]}",
+            f"Processing   {summary['by_state'][State.PROCESSING]}",
+            f"Completed    {summary['by_state'][State.COMPLETED]}",
+            f"Failed       {summary['by_state'][State.FAILED]}",
+            f"Dead         {summary['by_state'][State.DEAD]}",
+            f"Workers      {running_count}",
+            f"Success Rate {summary['success_rate_pct']}%",
+        ]
+    )
+    stats_panel = Panel(stats_lines, title="QueueCTL Dashboard", expand=False)
+
+    workers_table = Table(title="Current Workers", show_header=True, header_style="bold")
+    workers_table.add_column("ID")
+    workers_table.add_column("PID")
+    workers_table.add_column("Status")
+    workers_table.add_column("Heartbeat")
+    for w in workers:
+        age_seconds = (utcnow() - w.last_heartbeat).total_seconds()
+        status_text = w.status + (" (STALE)" if _is_worker_stale(w) else "")
+        workers_table.add_row(w.worker_id, str(w.pid), status_text, f"{age_seconds:.0f}s ago")
+
+    jobs_table = Table(title="Recent Jobs", show_header=True, header_style="bold")
+    jobs_table.add_column("ID")
+    jobs_table.add_column("State")
+    jobs_table.add_column("Command")
+    for j in recent_jobs:
+        jobs_table.add_row(j.id, j.state, j.command)
+
+    console = _console()
+    console.print(stats_panel)
+    console.print(workers_table)
+    console.print(jobs_table)
+    console.print(f"Queue Health: DLQ has {dead_count} job(s)")
+
+
 @main.command("list")
 @click.option("--state", "state", type=click.Choice(State.ALL), default=None, help="Filter by job state.")
 @click.option("--limit", default=None, type=int, help="Limit number of results.")
@@ -294,6 +429,7 @@ def job_delete(job_id, yes):
         raise click.ClickException(str(exc))
     finally:
         session.close()
+    get_app_logger().info(f"Job {job_id} deleted")
     click.echo(f"Deleted job {job_id}")
 
 
@@ -342,7 +478,7 @@ def dlq_retry_cmd(job_id):
             raise click.ClickException(str(exc))
     finally:
         session.close()
-    get_worker_logger().info(f"[cli] Job {job_id} manually retried from DLQ")
+    get_app_logger().info(f"Job {job_id} manually retried from DLQ")
     click.echo(message)
 
 
@@ -362,7 +498,7 @@ def dlq_delete_cmd(job_id, yes):
             raise click.ClickException(str(exc))
     finally:
         session.close()
-    get_worker_logger().info(f"[cli] Job {job_id} deleted from DLQ")
+    get_app_logger().info(f"Job {job_id} deleted from DLQ")
     click.echo(f"Deleted job {job_id}")
 
 
@@ -378,9 +514,13 @@ def config_set(key, value):
     """Set a configuration value, e.g. queuectl config set max-retries 3"""
     session = _session()
     try:
-        config_mod.set_config(session, key.replace("-", "_"), value)
+        try:
+            config_mod.set_config(session, key.replace("-", "_"), value)
+        except QueueCTLError as exc:
+            raise click.ClickException(str(exc))
     finally:
         session.close()
+    get_app_logger().info(f"Config changed: {key} = {value}")
     click.echo(f"Set {key} = {value}")
 
 
@@ -403,13 +543,27 @@ def config_get(key):
         session.close()
 
 
+def _print_all_config(session):
+    for k, v in config_mod.get_all(session).items():
+        click.echo(f"{k} = {v}")
+
+
 @config.command("list")
 def config_list():
     """List all configuration values."""
     session = _session()
     try:
-        for k, v in config_mod.get_all(session).items():
-            click.echo(f"{k} = {v}")
+        _print_all_config(session)
+    finally:
+        session.close()
+
+
+@config.command("show")
+def config_show():
+    """Alias for `config list` (the name this project's phase docs use)."""
+    session = _session()
+    try:
+        _print_all_config(session)
     finally:
         session.close()
 
@@ -427,7 +581,54 @@ def config_reset(key):
             raise click.ClickException(str(exc))
     finally:
         session.close()
+    get_app_logger().info(f"Config reset: {key}" if key else "Config reset: all keys to defaults")
     click.echo(f"Reset {key}" if key else "Reset all configuration values to defaults")
+
+
+@config.command("delete")
+@click.argument("key")
+def config_delete(key):
+    """Remove a single key's override, falling back to its default (same
+    effect as `config reset <key>`, under the name the assignment's
+    config-management phase doc uses)."""
+    session = _session()
+    try:
+        try:
+            config_mod.delete(session, key.replace("-", "_"))
+        except QueueCTLError as exc:
+            raise click.ClickException(str(exc))
+    finally:
+        session.close()
+    get_app_logger().info(f"Config changed: {key} deleted (back to default)")
+    click.echo(f"Deleted override for {key} (back to default)")
+
+
+@config.command("export")
+@click.argument("path", type=click.Path(dir_okay=False, writable=True))
+def config_export(path):
+    """Write every configuration value to a JSON file, e.g. for reuse in another deployment."""
+    session = _session()
+    try:
+        config_mod.export_config(session, path)
+    finally:
+        session.close()
+    click.echo(f"Exported configuration to {path}")
+
+
+@config.command("import")
+@click.argument("path", type=click.Path(exists=True, dir_okay=False))
+def config_import(path):
+    """Load configuration values from a JSON file (as produced by `config export`)."""
+    session = _session()
+    try:
+        try:
+            config_mod.import_config(session, path)
+        except QueueCTLError as exc:
+            raise click.ClickException(str(exc))
+    finally:
+        session.close()
+    get_app_logger().info(f"Config changed: imported from {path}")
+    click.echo(f"Imported configuration from {path}")
 
 
 if __name__ == "__main__":

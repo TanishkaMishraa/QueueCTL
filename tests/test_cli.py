@@ -110,6 +110,73 @@ def test_config_set_and_get(tmp_path):
     assert "max-retries = 5" in result.output
 
 
+def test_config_set_rejects_invalid_value(tmp_path):
+    runner = CliRunner()
+    db_path = tmp_path / "cli_test.db"
+    result = _invoke(runner, db_path, "config", "set", "backoff-base", "0.5")
+    assert result.exit_code != 0
+    assert "backoff_base" in result.output
+
+
+def test_config_show_lists_all_keys(tmp_path):
+    runner = CliRunner()
+    db_path = tmp_path / "cli_test.db"
+    result = _invoke(runner, db_path, "config", "show")
+    assert result.exit_code == 0
+    assert "max_retries = 3" in result.output
+    assert "max_workers = 10" in result.output
+    assert "default_priority = 0" in result.output
+
+
+def test_config_delete_resets_single_key(tmp_path):
+    runner = CliRunner()
+    db_path = tmp_path / "cli_test.db"
+    _invoke(runner, db_path, "config", "set", "max-retries", "9")
+
+    result = _invoke(runner, db_path, "config", "delete", "max-retries")
+    assert result.exit_code == 0
+
+    result = _invoke(runner, db_path, "config", "get", "max-retries")
+    assert "max-retries = 3" in result.output
+
+
+def test_config_export_then_import_round_trips(tmp_path):
+    runner = CliRunner()
+    db_path = tmp_path / "cli_test.db"
+    export_path = tmp_path / "exported.json"
+
+    _invoke(runner, db_path, "config", "set", "max-retries", "9")
+    result = _invoke(runner, db_path, "config", "export", str(export_path))
+    assert result.exit_code == 0
+    assert export_path.exists()
+
+    data = json.loads(export_path.read_text())
+    assert data["max_retries"] == 9
+
+    db_path2 = tmp_path / "cli_test2.db"
+    result = _invoke(runner, db_path2, "config", "import", str(export_path))
+    assert result.exit_code == 0
+    result = _invoke(runner, db_path2, "config", "get", "max-retries")
+    assert "max-retries = 9" in result.output
+
+
+def test_config_import_missing_file(tmp_path):
+    runner = CliRunner()
+    db_path = tmp_path / "cli_test.db"
+    result = _invoke(runner, db_path, "config", "import", str(tmp_path / "nope.json"))
+    assert result.exit_code != 0
+
+
+def test_worker_start_rejects_count_over_max_workers(tmp_path):
+    runner = CliRunner()
+    db_path = tmp_path / "cli_test.db"
+    _invoke(runner, db_path, "config", "set", "max-workers", "2")
+
+    result = _invoke(runner, db_path, "worker", "start", "--count", "3")
+    assert result.exit_code != 0
+    assert "max_workers" in result.output
+
+
 def test_status_shows_job_counts(tmp_path):
     runner = CliRunner()
     db_path = tmp_path / "cli_test.db"
@@ -120,6 +187,41 @@ def test_status_shows_job_counts(tmp_path):
     assert "Total jobs: 1" in result.output
     assert "pending" in result.output
     assert "Workers Running: 0" in result.output
+
+
+def test_stats_shows_execution_summary(tmp_path):
+    runner = CliRunner()
+    db_path = tmp_path / "cli_test.db"
+    _make_dead_job_via_repo(db_path, "deadjob")
+
+    result = _invoke(runner, db_path, "stats")
+    assert result.exit_code == 0
+    assert "Jobs Executed" in result.output
+    assert "DLQ       : 1" in result.output
+    assert "Success Rate" in result.output
+
+
+def test_health_reports_ok_when_database_reachable(tmp_path):
+    runner = CliRunner()
+    db_path = tmp_path / "cli_test.db"
+
+    result = _invoke(runner, db_path, "health")
+    assert result.exit_code == 0
+    assert "[OK] Healthy" in result.output
+    assert "[WARN] None running" in result.output
+    assert "[OK] Loaded" in result.output
+
+
+def test_dashboard_renders_without_error(tmp_path):
+    runner = CliRunner()
+    db_path = tmp_path / "cli_test.db"
+    _invoke(runner, db_path, "enqueue", json.dumps({"id": "job1", "command": "echo hi"}))
+
+    result = _invoke(runner, db_path, "dashboard")
+    assert result.exit_code == 0
+    assert "QueueCTL Dashboard" in result.output
+    assert "job1" in result.output
+    assert "Queue Health" in result.output
 
 
 def test_status_flags_stale_worker_heartbeat(tmp_path):

@@ -98,7 +98,7 @@ def scenario_2_retry_backoff_dlq(tmp_dir):
     # Small backoff base so the scenario finishes quickly; exponential math
     # itself is covered precisely by tests/test_queue_ops.py.
     run_cli("config", "set", "max-retries", "2", env=env)
-    run_cli("config", "set", "backoff-base", "1", env=env)
+    run_cli("config", "set", "backoff-base", "1.1", env=env)
     cmd = f'{PYTHON} -c "import sys; sys.exit(1)"'
     run_cli("enqueue", json.dumps({"id": "job2", "command": cmd, "max_retries": 2}), env=env)
     run_cli("worker", "start", "--count", "1", env=env)

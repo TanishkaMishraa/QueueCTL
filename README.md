@@ -113,12 +113,55 @@ Deleted job a1b2c3d4e5f6
 $ queuectl config set max-retries 5
 Set max-retries = 5
 
-$ queuectl config list
+$ queuectl config set backoff-base 0.5
+Error: backoff_base must be > 1
+
+$ queuectl config show
 max_retries = 5
 backoff_base = 2
 poll_interval = 1
 heartbeat_interval = 2
 timeout = 30
+default_priority = 0
+max_workers = 10
+
+$ queuectl config export backup.json
+Exported configuration to backup.json
+
+$ queuectl config delete max-retries
+Deleted override for max-retries (back to default)
+
+$ queuectl stats
+Jobs Executed
+  Completed : 95
+  Failed    : 8
+  Retries   : 12
+  DLQ       : 4
+
+Average Runtime : 1.84 sec
+Longest Runtime : 6.20 sec
+Shortest Runtime: 0.10 sec
+
+Success Rate: 92.2%
+Failure Rate: 7.8%
+Retry Rate  : 11.7%
+Throughput  : 47.5 jobs/hour
+
+$ queuectl health
+Database
+  [OK] Healthy
+
+Workers
+  [OK] Running (3 active)
+
+Queue
+  [OK] Accepting Jobs
+
+DLQ
+  4 Job(s)
+
+Configuration
+  [OK] Loaded
 
 $ queuectl worker stop
 Stop requested for 3 worker(s); 3 confirmed stopped.
@@ -149,6 +192,9 @@ e.g. `python -c "import time; time.sleep(2)"` or PowerShell's
 | `queuectl worker stop [--timeout SEC]` | Ask all running workers to finish their current job and exit; waits up to `--timeout` seconds for confirmation. |
 | `queuectl worker list` | List worker processes with PID, status, current job, and heartbeat age; flags any with a stale heartbeat. A focused view of what `status` also shows. |
 | `queuectl status` | Job counts by state, attempt/success stats, and active worker list. |
+| `queuectl stats` | Execution statistics: completed/failed/retries/DLQ counts, average/longest/shortest runtime, success/failure/retry rate, throughput. |
+| `queuectl health` | Checks database connectivity, worker availability, queue accessibility, and configuration; `[OK]`/`[WARN]`/`[FAIL]` per check. |
+| `queuectl dashboard` | Rich multi-panel view: queue stats, current workers, recent jobs, DLQ health — a visual superset of `status`, which stays plain-text/scriptable. |
 | `queuectl list [--state STATE] [--limit N]` | List jobs (Rich table), optionally filtered by state. |
 | `queuectl job show <job_id>` | Show full details for one job (command, state, attempts, timestamps, last error). |
 | `queuectl job delete <job_id> [--yes]` | Delete a job permanently; prompts for confirmation unless `--yes`/`-y` is given. |
@@ -156,7 +202,8 @@ e.g. `python -c "import time; time.sleep(2)"` or PowerShell's
 | `queuectl dlq count` | Show how many jobs are currently in the DLQ. |
 | `queuectl dlq retry <job_id>` | Reset a DLQ job back to `pending` (attempts and `next_retry` cleared). |
 | `queuectl dlq delete <job_id> [--yes]` | Permanently delete a job, but only if it's actually in the DLQ; prompts for confirmation unless `--yes`/`-y`. Rejects a job that isn't dead (use `queuectl job delete` for that). |
-| `queuectl config set/get/list/reset` | Manage `max-retries`, `backoff-base`, `poll-interval`, `heartbeat-interval`, `timeout`. `reset [key]` restores one key (or all, if omitted) back to its default. |
+| `queuectl config set/get/list/show/reset/delete` | Manage `max-retries`, `backoff-base`, `poll-interval`, `heartbeat-interval`, `timeout`, `default-priority`, `max-workers`. `show` is an alias for `list`; `delete <key>` and `reset <key>` both restore that one key's default; `reset` with no key restores everything. |
+| `queuectl config export <file>` / `queuectl config import <file>` | Write all config values to a JSON file, or load them back from one (e.g. to replicate settings across a deployment). |
 
 All commands support `--help`.
 
@@ -197,11 +244,29 @@ forward every call unchanged. `update_job` deliberately only allows editing
 fields (`state`, `attempts`, `next_retry`, `worker_id`, `last_error`) are
 only ever changed by the lifecycle functions, so there's exactly one code
 path that can move a job between states. **Config repository**
-(`config.py`): `get_config`/`set_config`/`reset_config`/`get_all`, plus
-`load_defaults` which seeds the `config` table with every known default
-key (idempotent — called on every `database.get_session()`), so `queuectl
-config list` always shows the complete set of tunables even before
-anything has been overridden.
+(`config.py`): `get_config`/`set_config`/`get_all`/`exists`/`delete`/
+`reset_config`/`export_config`/`import_config`, plus `load_defaults`
+which seeds the `config` table with every known default key (idempotent
+— called on every `database.get_session()`), so `queuectl config show`
+always shows the complete set of tunables even before anything has been
+overridden. Every known key (`max_retries`, `backoff_base`,
+`poll_interval`, `heartbeat_interval`, `timeout`, `default_priority`,
+`max_workers`) has a validator in `config._VALIDATORS`, run by
+`set_config` before anything is written — `backoff_base` must be `> 1`
+(a base of 1 or less would never grow the retry delay), the interval/
+timeout/`max_workers` keys must be positive, `max_retries`/
+`default_priority` must be non-negative — and `set_config` also rejects
+unknown keys outright rather than silently storing them. `poll_interval`
+and `backoff_base` are read fresh from config on every worker loop
+iteration (not cached at worker startup), so `queuectl config set
+poll-interval 5` takes effect on already-running workers within one
+cycle; `max_retries`/`priority` are captured once per job at enqueue
+time instead, since changing an in-flight job's already-decided retry
+budget out from under it would be surprising, not useful.
+`export_config`/`import_config` round-trip the table through a JSON file
+of numbers (not the raw strings stored internally) via `queuectl config
+export/import <file>`, validating every key before writing anything on
+import so a bad file can't partially apply.
 
 **Validation & errors**: `validators.py` checks each job field in
 isolation (non-empty command, `max_retries >= 0` — a job created with
@@ -393,15 +458,33 @@ exit, a shell "command not found", or a timeout) is a normal, retryable
 failure — there's no separate code path for "the command didn't exist"
 versus "the command ran and returned 1".
 
-**Worker activity logging**: each worker process appends plain-text
-lifecycle events — started, picked up job X, completed in N seconds,
-failed/retry-in-Ns, exceeded retries → DLQ, stopped — to `logs/worker.log`
-(`worker_logging.py`; override the directory with `QUEUECTL_LOG_DIR`).
-This is separate from the `job_logs` database table: `job_logs` is
+**Logging** (`app_logging.py`; override the directory with
+`QUEUECTL_LOG_DIR`, default `./logs`): three plain-text files, all via
+Python's standard `logging` module —
+- `worker.log` — each worker process's lifecycle: started, picked up job
+  X, completed in N seconds, failed/retry-in-Ns, exceeded retries → DLQ,
+  stopped.
+- `queuectl.log` — general CLI-driven events: job created, job deleted,
+  config changed, DLQ manually retried/deleted.
+- `error.log` — every ERROR-level record logged anywhere (currently just
+  "exceeded retries, moved to DLQ"), collected in one place for quick
+  triage.
+
+`error.log`'s contents aren't a separate, manually-duplicated log call:
+`get_app_logger()`/`get_worker_logger()` return children of a `"queuectl"`
+root logger, and a child logger's records propagate up to that root by
+default. The root's own handler is filtered to `level=ERROR`, so calling
+`.error(...)` on either child logger writes to that child's own file
+*and* error.log, while `.info()`/`.warning()` calls propagate too but get
+filtered out by the root handler's level before they'd reach error.log.
+One call site, two files, with no explicit "also log this as an error"
+second call needed.
+
+This is all separate from the `job_logs` database table: `job_logs` is
 structured, queryable, per-attempt stdout/stderr/exit-code data (the job
-output logging bonus feature); `worker.log` is an operational log of
-*worker* activity you'd tail while a queue is running, e.g. to record the
-demo video (`scripts/worker_demo.py` prints its location).
+output logging bonus feature); the three log files above are plain-text
+operational logs you'd tail while a queue is running, e.g. to record the
+demo video (`scripts/worker_demo.py` prints where they live).
 
 **Scheduling & priority (bonus)**: `run_at` (ISO timestamp) on a job makes
 it ineligible until that time — this is the `run_at`/delayed-jobs bonus
@@ -516,8 +599,11 @@ python scripts/worker_demo.py
 ## Bonus features implemented
 
 - Job timeout handling (`timeout_seconds` per job)
-- Job priority queues (`priority` field, higher first)
+- Job priority queues (`priority` field, higher first; `default_priority` configurable)
 - Scheduled/delayed jobs (`run_at`)
 - Job output logging (`job_logs` table: stdout/stderr/exit code/duration per attempt)
-- Worker activity logging (`logs/worker.log`: started/picked/completed/failed/retry/DLQ/stopped events)
-- Execution stats (attempts logged + success rate in `queuectl status`)
+- Operational logging (`logs/worker.log`, `logs/queuectl.log`, `logs/error.log`)
+- Execution stats & metrics (`queuectl stats`: success/failure/retry rate, runtime, throughput)
+- Queue health check (`queuectl health`)
+- Rich dashboard (`queuectl dashboard`)
+- Config import/export (`queuectl config export/import <file>`), per-key validation, and a worker-count cap (`max_workers`)

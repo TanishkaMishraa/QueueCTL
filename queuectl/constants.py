@@ -19,6 +19,7 @@ DEFAULT_TIMEOUT = 30
 DEFAULT_PRIORITY = 0
 DEFAULT_POLL_INTERVAL = 1
 DEFAULT_HEARTBEAT_INTERVAL = 2
+DEFAULT_MAX_WORKERS = 10
 
 # A worker whose last_heartbeat is older than this is considered dead/stuck
 # (crashed, killed, hung) even though its `workers` row still says

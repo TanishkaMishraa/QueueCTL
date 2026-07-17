@@ -43,7 +43,7 @@ def main():
     print(f"Worker log: {DEMO_DIR / 'logs' / 'worker.log'}\n", flush=True)
 
     print("--- Configuring a fast backoff for a snappier demo ---", flush=True)
-    run_cli("config", "set", "backoff-base", "1", env=env)
+    run_cli("config", "set", "backoff-base", "1.1", env=env)
 
     print("\n--- Enqueuing jobs ---", flush=True)
     ok_cmd = f'{PYTHON} -c "print(\'hello from queuectl\')"'
