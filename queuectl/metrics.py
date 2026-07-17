@@ -3,6 +3,7 @@ rates, computed from data queue_ops.py already fetches. This module holds
 no ORM queries of its own -- consistent with queue_ops.py being the only
 module that touches Session directly (see dlq.py for the same pattern).
 """
+
 from . import queue_ops
 from .models import State
 
@@ -21,7 +22,9 @@ def calculate_metrics(session) -> dict:
     longest_runtime = max(durations) if durations else 0.0
     shortest_runtime = min(durations) if durations else 0.0
 
-    success_rate = round((total_attempts - failed_attempts) / total_attempts * 100, 1) if total_attempts else 0.0
+    success_rate = (
+        round((total_attempts - failed_attempts) / total_attempts * 100, 1) if total_attempts else 0.0
+    )
     failure_rate = round(failed_attempts / total_attempts * 100, 1) if total_attempts else 0.0
     retry_rate = round(retry_attempts / total_attempts * 100, 1) if total_attempts else 0.0
 

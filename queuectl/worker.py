@@ -6,18 +6,17 @@ executes it, and records the outcome. It never picks up a new job once a
 stop has been requested -- it always finishes the job currently in hand
 first, which is what makes shutdown graceful.
 """
+
 import os
 import signal
 import sys
 import time
 
 from . import config as config_mod
-from . import database
-from . import queue_ops
-from . import retry
+from . import database, queue_ops, retry
+from .app_logging import get_worker_logger
 from .executor import run_command
 from .models import State, Worker
-from .app_logging import get_worker_logger
 from .utils import new_id, utcnow
 
 _stop_requested = False
@@ -88,7 +87,9 @@ def run(worker_id: str = None) -> None:
                 if job.state == State.DEAD:
                     # ERROR level: this is the event error.log exists to
                     # surface -- a job has permanently failed.
-                    logger.error(f"[{worker_id}] Job {job.id} exceeded retries ({job.attempts}/{job.max_retries}), moved to DLQ")
+                    logger.error(
+                        f"[{worker_id}] Job {job.id} exceeded retries ({job.attempts}/{job.max_retries}), moved to DLQ"
+                    )
                 else:
                     delay = retry.calculate_delay(job.attempts, backoff_base)
                     logger.warning(

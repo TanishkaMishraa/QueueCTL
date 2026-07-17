@@ -2,6 +2,7 @@
 duplicate-id checking is a repository concern (queue_ops.job_exists) since
 it requires a query; everything else about a job's shape is checked here.
 """
+
 from typing import Optional
 
 from .exceptions import InvalidJobDataError

@@ -6,6 +6,7 @@ directly.
 
 Run with:  python scripts/validate_db.py
 """
+
 import shutil
 import sys
 import tempfile

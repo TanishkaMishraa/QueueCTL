@@ -6,6 +6,7 @@ to the database directly -- every function here delegates the actual
 Session.query/add/delete work to queue_ops.py, which remains the only
 module that does that.
 """
+
 from typing import List, Optional
 
 from sqlalchemy.orm import Session

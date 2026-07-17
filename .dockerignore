@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+queuectl_data/
+demo_data/
+logs/
+.git/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

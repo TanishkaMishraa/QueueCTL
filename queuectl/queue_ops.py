@@ -1,6 +1,7 @@
 """Repository layer: the only module that writes SQL/ORM queries for the
 `jobs` table. Every other module (cli.py, worker.py) goes through here.
 """
+
 from typing import List, Optional
 
 from sqlalchemy import and_, func, or_
@@ -8,8 +9,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from . import config as config_mod
-from . import retry
-from . import validators
+from . import retry, validators
 from .exceptions import DatabaseError, DuplicateJobError, InvalidJobStateError, JobNotFoundError
 from .executor import ExecutionResult
 from .models import Job, JobLog, State, Worker

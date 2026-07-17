@@ -1,5 +1,6 @@
 import json
 import sys
+import time
 
 import click
 from rich.console import Console
@@ -7,16 +8,14 @@ from rich.panel import Panel
 from rich.table import Table
 
 from . import config as config_mod
-from . import constants
-from . import database
+from . import constants, database
 from . import dlq as dlq_mod
 from . import metrics as metrics_mod
-from . import queue_ops
-from . import worker_manager
+from . import queue_ops, worker_manager
+from .app_logging import get_app_logger
 from .exceptions import JobNotFoundError, QueueCTLError
 from .models import State
 from .utils import utcnow
-from .app_logging import get_app_logger
 
 # Fixed width avoids Rich wrapping/truncating output differently depending
 # on whether stdout is a real terminal, a pipe, or captured by tests.
@@ -40,9 +39,7 @@ def _parse_priority(value):
     try:
         return int(value)
     except (TypeError, ValueError):
-        raise click.ClickException(
-            f"Invalid --priority {value!r}: use an integer, or one of low/normal/high"
-        )
+        raise click.ClickException(f"Invalid --priority {value!r}: use an integer, or one of low/normal/high")
 
 
 def _is_worker_stale(w) -> bool:
@@ -125,7 +122,9 @@ def main():
 @click.option("--id", "job_id", default=None, help="Custom job id (default: auto-generated).")
 @click.option("--priority", default=None, help="Integer, or one of low/normal/high (default: normal/0).")
 @click.option("--timeout", "timeout_seconds", default=None, type=int, help="Per-job timeout in seconds.")
-@click.option("--max-retries", "max_retries", default=None, type=int, help="Max attempts before moving to the DLQ.")
+@click.option(
+    "--max-retries", "max_retries", default=None, type=int, help="Max attempts before moving to the DLQ."
+)
 @click.option("--run-at", default=None, help="ISO timestamp; job won't be claimed before this time.")
 def enqueue(job_arg, job_id, priority, timeout_seconds, max_retries, run_at):
     """Add a new job to the queue.
@@ -180,7 +179,9 @@ def worker():
 
 @worker.command("start")
 @click.option("--count", default=1, show_default=True, help="Number of worker processes to start.")
-@click.option("--foreground", is_flag=True, help="Run a single worker in the foreground (blocks; Ctrl+C to stop).")
+@click.option(
+    "--foreground", is_flag=True, help="Run a single worker in the foreground (blocks; Ctrl+C to stop)."
+)
 def worker_start(count, foreground):
     """Start one or more workers."""
     session = _session()
@@ -206,7 +207,12 @@ def worker_start(count, foreground):
 
 
 @worker.command("stop")
-@click.option("--timeout", default=10.0, show_default=True, help="Seconds to wait for workers to finish their current job.")
+@click.option(
+    "--timeout",
+    default=10.0,
+    show_default=True,
+    help="Seconds to wait for workers to finish their current job.",
+)
 def worker_stop(timeout):
     """Stop running workers gracefully (finishes in-flight jobs first)."""
     result = worker_manager.stop_workers(timeout=timeout)
@@ -250,8 +256,10 @@ def status():
     for state in State.ALL:
         click.echo(f"  {state:<10} {summary['by_state'][state]}")
 
-    click.echo(f"\nAttempts logged: {summary['total_attempts_logged']}  "
-               f"Success rate: {summary['success_rate_pct']}%")
+    click.echo(
+        f"\nAttempts logged: {summary['total_attempts_logged']}  "
+        f"Success rate: {summary['success_rate_pct']}%"
+    )
 
     click.echo(f"\nWorkers Running: {running_count}")
     if not worker_lines:
@@ -311,7 +319,9 @@ def health():
     click.echo("  [OK] Healthy")
 
     click.echo("\nWorkers")
-    click.echo(f"  [OK] Running ({len(active_workers)} active)" if active_workers else "  [WARN] None running")
+    click.echo(
+        f"  [OK] Running ({len(active_workers)} active)" if active_workers else "  [WARN] None running"
+    )
 
     click.echo("\nQueue")
     click.echo("  [OK] Accepting Jobs")
@@ -371,6 +381,70 @@ def dashboard():
     console.print(workers_table)
     console.print(jobs_table)
     console.print(f"Queue Health: DLQ has {dead_count} job(s)")
+
+
+@main.command()
+@click.option(
+    "--jobs", "job_count", default=100, show_default=True, help="Number of trivial jobs to enqueue and time."
+)
+@click.option(
+    "--workers", "worker_count", default=4, show_default=True, help="Number of workers to process them."
+)
+@click.option(
+    "--timeout", default=60.0, show_default=True, help="Max seconds to wait for the batch to finish."
+)
+def benchmark(job_count, worker_count, timeout):
+    """Enqueue JOBS trivial jobs, process them with fresh workers, and report throughput.
+
+    Optional/bonus feature -- not part of the assignment's required
+    command set. Starts its own workers and stops them again when done,
+    independent of any workers you already have running.
+    """
+    session = _session()
+    try:
+        max_workers = config_mod.get_int(session, "max_workers")
+        if worker_count > max_workers:
+            raise click.ClickException(
+                f"--workers {worker_count} exceeds max_workers={max_workers} "
+                f"(queuectl config set max-workers N to raise this)."
+            )
+        for _ in range(job_count):
+            queue_ops.create_job(session, {"command": "echo bench"})
+    finally:
+        session.close()
+
+    click.echo(f"Enqueued {job_count} jobs. Starting {worker_count} worker(s)...")
+    worker_manager.start_workers(worker_count)
+
+    started = time.monotonic()
+    deadline = started + timeout
+    session = _session()
+    try:
+        completed = queue_ops.count_jobs(session, state=State.COMPLETED)
+        # Every transaction on this engine opens with BEGIN IMMEDIATE (see
+        # database.py), including this read-only count -- committing after
+        # each check releases that write lock between polls. Without it,
+        # this loop holds the lock for the entire wait and starves every
+        # worker trying to claim a job (the same bug worker_manager.stop_workers
+        # had to be fixed for; see design.md).
+        session.commit()
+        while time.monotonic() < deadline and completed < job_count:
+            time.sleep(0.2)
+            completed = queue_ops.count_jobs(session, state=State.COMPLETED)
+            session.commit()
+        elapsed = time.monotonic() - started
+        m = metrics_mod.calculate_metrics(session)
+    finally:
+        session.close()
+
+    worker_manager.stop_workers(timeout=10)
+
+    throughput = completed / elapsed if elapsed > 0 else 0.0
+    click.echo(f"\n{completed}/{job_count} Jobs Completed")
+    click.echo(f"Average Runtime : {m['avg_runtime_seconds']:.2f} sec")
+    click.echo(f"\nThroughput      : {throughput:.1f} jobs/sec")
+    if completed < job_count:
+        click.echo(f"(Timed out after {timeout}s waiting for the remaining {job_count - completed} job(s).)")
 
 
 @main.command("list")

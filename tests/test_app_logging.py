@@ -3,6 +3,7 @@ ERROR-level records from both the app and worker loggers via Python's
 logging propagation, without a second explicit log call anywhere -- and
 INFO/WARNING records should stay out of it.
 """
+
 import logging
 
 import pytest

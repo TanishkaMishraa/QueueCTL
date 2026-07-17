@@ -13,13 +13,14 @@ def _spawn_detached(worker_id: str) -> None:
     args = [sys.executable, "-m", "queuectl.worker", worker_id]
     kwargs = {}
     if os.name == "nt":
-        kwargs["creationflags"] = (
-            subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(
+            subprocess, "DETACHED_PROCESS", 0x00000008
         )
     else:
         kwargs["start_new_session"] = True
     subprocess.Popen(
         args,
+        cwd=os.getcwd(),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

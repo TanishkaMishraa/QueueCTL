@@ -65,7 +65,9 @@ def test_enqueue_accepts_plain_command(tmp_path):
     runner = CliRunner()
     db_path = tmp_path / "cli_test.db"
 
-    result = _invoke(runner, db_path, "enqueue", "echo Hello World", "--priority", "high", "--max-retries", "5")
+    result = _invoke(
+        runner, db_path, "enqueue", "echo Hello World", "--priority", "high", "--max-retries", "5"
+    )
     assert result.exit_code == 0
     assert "Job Created" in result.output
 
@@ -383,3 +385,25 @@ def test_job_delete_missing_job(tmp_path):
     result = _invoke(runner, db_path, "job", "delete", "nope", "--yes")
     assert result.exit_code != 0
     assert "not found" in result.output.lower()
+
+
+def test_benchmark_completes_a_small_batch(tmp_path):
+    # Regression test: the polling loop inside `benchmark` must commit
+    # after each read, or it holds the BEGIN IMMEDIATE write lock for the
+    # entire wait and starves every worker trying to claim a job (see
+    # design.md) -- this would show up here as 0 jobs completed.
+    runner = CliRunner()
+    db_path = tmp_path / "cli_test.db"
+    result = _invoke(runner, db_path, "benchmark", "--jobs", "5", "--workers", "2", "--timeout", "20")
+    assert result.exit_code == 0
+    assert "5/5 Jobs Completed" in result.output
+    assert "Timed out" not in result.output
+
+
+def test_benchmark_rejects_worker_count_over_max_workers(tmp_path):
+    runner = CliRunner()
+    db_path = tmp_path / "cli_test.db"
+    _invoke(runner, db_path, "config", "set", "max-workers", "2")
+    result = _invoke(runner, db_path, "benchmark", "--jobs", "1", "--workers", "5")
+    assert result.exit_code != 0
+    assert "exceeds max_workers" in result.output

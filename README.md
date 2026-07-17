@@ -204,6 +204,7 @@ e.g. `python -c "import time; time.sleep(2)"` or PowerShell's
 | `queuectl dlq delete <job_id> [--yes]` | Permanently delete a job, but only if it's actually in the DLQ; prompts for confirmation unless `--yes`/`-y`. Rejects a job that isn't dead (use `queuectl job delete` for that). |
 | `queuectl config set/get/list/show/reset/delete` | Manage `max-retries`, `backoff-base`, `poll-interval`, `heartbeat-interval`, `timeout`, `default-priority`, `max-workers`. `show` is an alias for `list`; `delete <key>` and `reset <key>` both restore that one key's default; `reset` with no key restores everything. |
 | `queuectl config export <file>` / `queuectl config import <file>` | Write all config values to a JSON file, or load them back from one (e.g. to replicate settings across a deployment). |
+| `queuectl benchmark --jobs N --workers W [--timeout SEC]` | Optional/bonus performance test: enqueues N trivial jobs, starts W fresh workers, waits for the batch to finish, then reports completion count, average runtime, and jobs/sec throughput. Starts and stops its own workers, independent of any already running. |
 
 All commands support `--help`.
 
@@ -450,13 +451,16 @@ computes a delay or a dead/alive decision itself, it only calls
 
 **Job execution** (`executor.py`, renamed from an earlier `execution.py`
 to match the "command executor" terminology): `run_command(command,
-timeout_seconds)` runs the job's command via `subprocess.run(shell=True)`,
-capturing `stdout`, `stderr`, `exit_code`, and `duration_seconds`
-(wall-clock time around the subprocess call) into an `ExecutionResult`.
-Exit code 0 is the only definition of success; everything else (non-zero
-exit, a shell "command not found", or a timeout) is a normal, retryable
-failure — there's no separate code path for "the command didn't exist"
-versus "the command ran and returned 1".
+timeout_seconds)` runs the job's command via `shell=True`, capturing
+`stdout`, `stderr`, `exit_code`, and `duration_seconds` (wall-clock time
+around the call) into an `ExecutionResult`. Exit code 0 is the only
+definition of success; everything else (non-zero exit, a shell "command
+not found", or a timeout) is a normal, retryable failure — there's no
+separate code path for "the command didn't exist" versus "the command ran
+and returned 1". Internally this is `subprocess.Popen` +
+`proc.communicate(timeout=...)` rather than the simpler
+`subprocess.run(..., timeout=...)` — see the trade-offs section below for
+why that distinction actually matters here, not just style.
 
 **Logging** (`app_logging.py`; override the directory with
 `QUEUECTL_LOG_DIR`, default `./logs`): three plain-text files, all via
@@ -513,7 +517,14 @@ and treated as an ordinary failure (retryable like any other).
   and sidesteps the GIL for CPU-bound job commands; the cost is that
   `worker start` returns once processes are spawned rather than blocking,
   so worker liveness is tracked via a DB row + heartbeat rather than an
-  in-memory handle.
+  in-memory handle. `worker_manager._spawn_detached` explicitly passes
+  `cwd=os.getcwd()` to `Popen` rather than relying on the child inheriting
+  the parent's working directory implicitly — on Windows, a process
+  launched with `DETACHED_PROCESS` isn't guaranteed to end up with the
+  same effective current directory as its parent otherwise, which
+  (observed on a real machine, not just in testing) let a worker silently
+  read/write a *different* `queuectl_data/queuectl.db` than the CLI
+  commands checking on it — see design.md for the full writeup.
 - **Stop is cooperative, not signal-based**: chosen for cross-platform
   consistency (this was developed/tested on Windows, where POSIX signal
   semantics don't fully apply). The trade-off is a worker can take up to
@@ -538,12 +549,33 @@ and treated as an ordinary failure (retryable like any other).
   job at 30s by default felt like a surprising behavior change for a
   feature the assignment lists as optional; explicit opt-in avoids
   breaking a legitimately long-running job that never asked for a limit.
+- **Job timeouts kill the whole process tree, not just the shell**: with
+  `shell=True`, the process actually started is `cmd.exe`/`sh -c`
+  wrapping the real command as a *grandchild*. `subprocess.run(...,
+  timeout=...)`'s built-in handling only kills that direct child, leaving
+  the grandchild running to completion in the background — on Windows,
+  the call doesn't even return in time, because `communicate()` stays
+  blocked on stdout/stderr pipes the orphaned grandchild still holds open.
+  Confirmed directly: a `time.sleep(10)` job with `timeout_seconds=1` took
+  ~10s to return under the naive approach. `executor.run_command` uses
+  `Popen` + a manual `TimeoutExpired` handler that kills the *tree*
+  (`taskkill /F /T /PID` on Windows, `os.killpg` on POSIX via
+  `start_new_session=True`) instead of just the immediate child — see
+  design.md for the full writeup and `tests/test_executor.py` for the
+  regression test.
 
 ## 5. Testing instructions
 
-Unit tests (fast, no real subprocess/worker spawning — job execution is
-exercised via constructed `ExecutionResult`s, and the concurrency guarantee
-is tested with real threads against a real SQLite file):
+Unit tests — one file per module (`test_database.py`, `test_queue_ops.py`,
+`test_executor.py`, `test_retry.py`, `test_dlq.py`, `test_worker.py`,
+`test_config.py`, `test_metrics.py`, `test_app_logging.py`,
+`test_worker_manager.py`, `test_cli.py`), 122 tests total. Mostly fast and
+mocking-free — real SQLite files, real threads for the concurrency
+guarantee, real subprocesses in `test_executor.py`'s timeout test — with
+`test_worker.py` the one exception that runs the actual `worker.run()`
+loop in a background thread (signal registration mocked out, since
+`signal.signal` only works on the main thread) rather than spawning a
+real OS process, which `scripts/validate_e2e.py` already covers:
 
 ```bash
 pytest
@@ -592,6 +624,39 @@ what recording the CLI demo video against is meant to look like):
 python scripts/worker_demo.py
 ```
 
+Performance benchmark (optional/bonus — not part of the assignment's
+required test scenarios):
+
+```bash
+queuectl benchmark --jobs 100 --workers 4
+```
+
+### Continuous Integration
+
+`.github/workflows/ci.yml` runs on every push/PR to `main`: installs the
+package, checks formatting (`black --check`) and import order
+(`isort --check-only`), then runs `pytest`, `scripts/validate_db.py`, and
+`scripts/validate_e2e.py` — on a matrix of Ubuntu and Windows runners
+across two Python versions, so both the Windows-specific code paths
+(`taskkill`-based process tree kill, the `cwd`-pinning fix) and the POSIX
+ones (`os.killpg`, `SIGKILL`) actually get exercised in CI, not just
+locally.
+
+### Packaging
+
+```bash
+pip install -e ".[dev]"   # editable install + dev tools (pytest, black, isort)
+black queuectl tests scripts     # format
+isort queuectl tests scripts     # sort imports
+```
+
+A `Dockerfile` is included as an optional packaging target (not required
+by the assignment): `docker build -t queuectl .` then
+`docker run --rm -v queuectl-data:/data -e QUEUECTL_DB=/data/queuectl.db queuectl enqueue "echo hi"`.
+Since a container has no shell left around to keep a *detached* background
+process alive, a long-running worker container needs `--foreground`:
+`docker run -d -v queuectl-data:/data -e QUEUECTL_DB=/data/queuectl.db queuectl worker start --count 1 --foreground`.
+
 ## Demo
 
 <!-- Add the recorded CLI demo link here before submitting, per the assignment's Submission section. -->
@@ -607,3 +672,33 @@ python scripts/worker_demo.py
 - Queue health check (`queuectl health`)
 - Rich dashboard (`queuectl dashboard`)
 - Config import/export (`queuectl config export/import <file>`), per-key validation, and a worker-count cap (`max_workers`)
+- Performance benchmark (`queuectl benchmark --jobs N --workers W`)
+- Packaging: `Dockerfile`, GitHub Actions CI (`.github/workflows/ci.yml`)
+
+## Future improvements
+
+Out of scope for this assignment, but the natural next steps if this
+grew into a real deployment rather than a single-machine CLI tool:
+
+- **Redis or PostgreSQL backend**: SQLite's single-writer model (the
+  `BEGIN IMMEDIATE` locking this project relies on) tops out well before
+  a high-throughput, multi-host queue would need. A Redis-backed queue
+  (e.g. atomic `RPOPLPUSH`/Lua-script claiming) or PostgreSQL with
+  `SELECT ... FOR UPDATE SKIP LOCKED` would remove the single-file,
+  single-machine ceiling entirely.
+- **REST API**: a thin FastAPI/Flask layer over `queue_ops.py`/`dlq.py`
+  (already structured as the only modules that touch the database) would
+  expose enqueue/status/DLQ operations to non-CLI clients without
+  duplicating any business logic.
+- **Distributed workers / Kubernetes**: workers are already independent,
+  crash-isolated OS processes with no shared in-memory state — the main
+  blocker to running them across multiple machines is purely the SQLite
+  file being local-disk-only. Swapping in the Redis/PostgreSQL backend
+  above would make a Kubernetes `Deployment` of worker pods (readiness
+  probes hitting `queuectl health`, `HorizontalPodAutoscaler` on queue
+  depth) a fairly direct extension of the existing worker loop.
+- **Web dashboard**: `queuectl dashboard` already renders a Rich terminal
+  view from the same `queue_ops.status_summary`/`dlq.count_dead_jobs`/
+  `metrics.calculate_metrics` calls a web UI would use — a small
+  Flask/FastAPI + HTMX or React frontend could reuse that data layer
+  as-is rather than needing new query logic.

@@ -17,6 +17,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.4",
+    "black>=24.0",
+    "isort>=5.13",
 ]
 
 [project.scripts]
@@ -24,3 +26,10 @@ queuectl = "queuectl.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["queuectl*"]
+
+[tool.black]
+line-length = 110
+
+[tool.isort]
+profile = "black"
+line_length = 110

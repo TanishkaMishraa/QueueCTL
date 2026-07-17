@@ -11,7 +11,7 @@ def calculate_delay(attempts: int, base: float) -> float:
     """Exponential backoff delay in seconds after `attempts` failed
     attempts: base ** attempts. With base=2, attempts 1/2/3/4 give
     2/4/8/16 seconds."""
-    return base ** attempts
+    return base**attempts
 
 
 def is_dead(attempts: int, max_retries: int) -> bool:

@@ -9,6 +9,7 @@ Drives the real `queuectl` CLI as subprocesses against a fresh, isolated
 SQLite database (no pytest, no mocking of subprocess execution) so it
 exercises the exact same code path a user would.
 """
+
 import json
 import os
 import shutil
@@ -33,9 +34,7 @@ def run_cli(*args, env, check=True):
         text=True,
     )
     if check and proc.returncode != 0:
-        raise RuntimeError(
-            f"CLI command failed: {args}\nstdout={proc.stdout}\nstderr={proc.stderr}"
-        )
+        raise RuntimeError(f"CLI command failed: {args}\nstdout={proc.stdout}\nstderr={proc.stderr}")
     return proc
 
 
@@ -88,7 +87,9 @@ def scenario_1_basic_completion(tmp_dir):
         assert ok, "job1 did not reach 'completed' state"
     finally:
         stop_out = run_cli("worker", "stop", env=env).stdout
-        assert "1 confirmed stopped" in stop_out, f"worker did not confirm graceful stop in time: {stop_out!r}"
+        assert (
+            "1 confirmed stopped" in stop_out
+        ), f"worker did not confirm graceful stop in time: {stop_out!r}"
     return "Basic job completes successfully"
 
 
@@ -127,7 +128,8 @@ def scenario_3_parallel_workers_no_duplicates(tmp_dir):
     run_cli("worker", "start", "--count", "4", env=env)
     try:
         ok = wait_until(
-            lambda: query_db(db_path, "SELECT COUNT(*) AS c FROM jobs WHERE state='completed'")[0]["c"] == n_jobs,
+            lambda: query_db(db_path, "SELECT COUNT(*) AS c FROM jobs WHERE state='completed'")[0]["c"]
+            == n_jobs,
             timeout=30,
         )
         assert ok, "not all jobs completed"
@@ -196,7 +198,9 @@ def scenario_6_graceful_shutdown_waits_for_current_job(tmp_dir):
         assert "1 confirmed stopped" in stop_out, f"worker did not shut down gracefully: {stop_out!r}"
 
         state = query_db(db_path, "SELECT state FROM jobs WHERE id='job6'")[0]["state"]
-        assert state == "completed", f"job6 should have finished before the worker stopped, got state={state!r}"
+        assert (
+            state == "completed"
+        ), f"job6 should have finished before the worker stopped, got state={state!r}"
     finally:
         run_cli("worker", "stop", env=env)
     return "Graceful shutdown finishes the in-flight job before the worker exits"
@@ -222,7 +226,8 @@ def scenario_7_worker_crash_others_continue(tmp_dir):
         force_kill(victim["pid"])
 
         ok = wait_until(
-            lambda: query_db(db_path, "SELECT COUNT(*) AS c FROM jobs WHERE state='completed'")[0]["c"] == n_jobs,
+            lambda: query_db(db_path, "SELECT COUNT(*) AS c FROM jobs WHERE state='completed'")[0]["c"]
+            == n_jobs,
             timeout=30,
         )
         assert ok, "surviving workers did not finish all jobs after one was killed"

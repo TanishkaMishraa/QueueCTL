@@ -2,8 +2,7 @@ import threading
 
 import pytest
 
-from queuectl import database
-from queuectl import queue_ops
+from queuectl import database, queue_ops
 from queuectl.exceptions import (
     DuplicateJobError,
     InvalidJobDataError,
