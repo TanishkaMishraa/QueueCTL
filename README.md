@@ -44,6 +44,7 @@
 <td width="50%">
 
 ### Core
+
 - 🔁 **Retry with Exponential Backoff** — configurable `backoff_base^attempts` delay
 - 💀 **Dead Letter Queue (DLQ)** — permanently failed jobs quarantined for review
 - 👷 **Parallel Workers** — independent OS processes with crash isolation
@@ -54,6 +55,7 @@
 <td width="50%">
 
 ### Bonus
+
 - ⏱️ **Job Timeouts** — per-job time limits with full process-tree kill
 - 📊 **Priority Queues** — higher priority jobs claimed first
 - 🕐 **Scheduled Jobs** — `run_at` delays execution until a target time
@@ -92,12 +94,12 @@ pip install -e ".[dev]"
 
 This installs the `queuectl` CLI command (via `pyproject.toml` entry point) powered by:
 
-| Dependency | Purpose |
-|---|---|
-| **Click** | CLI framework |
-| **Rich** | Formatted panels, tables & dashboard |
-| **SQLAlchemy** | ORM over SQLite |
-| **pytest** | Testing (dev dependency) |
+| Dependency     | Purpose                              |
+| -------------- | ------------------------------------ |
+| **Click**      | CLI framework                        |
+| **Rich**       | Formatted panels, tables & dashboard |
+| **SQLAlchemy** | ORM over SQLite                      |
+| **pytest**     | Testing (dev dependency)             |
 
 ### Database Location
 
@@ -231,56 +233,56 @@ $ queuectl config import backup.json
 
 ### Jobs
 
-| Command | Description |
-|---|---|
-| `queuectl enqueue "<command>" [options]` | Add a job. Options: `--id`, `--priority` (int or `low`/`normal`/`high`), `--timeout`, `--max-retries`, `--run-at` |
-| `queuectl enqueue '<json>'` | Add a job via JSON (auto-detected if starts with `{`) |
-| `queuectl list [--state STATE] [--limit N]` | List jobs, optionally filtered by state |
-| `queuectl job show <id>` | Full details for one job |
-| `queuectl job delete <id> [--yes]` | Delete a job permanently |
+| Command                                     | Description                                                                                                       |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `queuectl enqueue "<command>" [options]`    | Add a job. Options: `--id`, `--priority` (int or `low`/`normal`/`high`), `--timeout`, `--max-retries`, `--run-at` |
+| `queuectl enqueue '<json>'`                 | Add a job via JSON (auto-detected if starts with `{`)                                                             |
+| `queuectl list [--state STATE] [--limit N]` | List jobs, optionally filtered by state                                                                           |
+| `queuectl job show <id>`                    | Full details for one job                                                                                          |
+| `queuectl job delete <id> [--yes]`          | Delete a job permanently                                                                                          |
 
 ### Workers
 
-| Command | Description |
-|---|---|
-| `queuectl worker start --count N [--foreground]` | Start N worker processes (background by default) |
-| `queuectl worker stop [--timeout SEC]` | Graceful shutdown — workers finish current job first |
-| `queuectl worker list` | List workers with PID, status, heartbeat age |
+| Command                                          | Description                                          |
+| ------------------------------------------------ | ---------------------------------------------------- |
+| `queuectl worker start --count N [--foreground]` | Start N worker processes (background by default)     |
+| `queuectl worker stop [--timeout SEC]`           | Graceful shutdown — workers finish current job first |
+| `queuectl worker list`                           | List workers with PID, status, heartbeat age         |
 
 ### Dead Letter Queue
 
-| Command | Description |
-|---|---|
-| `queuectl dlq list` | List all dead jobs |
-| `queuectl dlq count` | Count dead jobs |
-| `queuectl dlq retry <id>` | Requeue a dead job back to `pending` |
+| Command                            | Description                                    |
+| ---------------------------------- | ---------------------------------------------- |
+| `queuectl dlq list`                | List all dead jobs                             |
+| `queuectl dlq count`               | Count dead jobs                                |
+| `queuectl dlq retry <id>`          | Requeue a dead job back to `pending`           |
 | `queuectl dlq delete <id> [--yes]` | Permanently delete (only works on `dead` jobs) |
 
 ### Monitoring
 
-| Command | Description |
-|---|---|
-| `queuectl status` | Job counts by state, attempt stats, active workers |
-| `queuectl stats` | Execution metrics: rates, runtimes, throughput |
-| `queuectl health` | System diagnostics: DB, workers, queue, config |
-| `queuectl dashboard` | Rich multi-panel terminal UI |
+| Command              | Description                                        |
+| -------------------- | -------------------------------------------------- |
+| `queuectl status`    | Job counts by state, attempt stats, active workers |
+| `queuectl stats`     | Execution metrics: rates, runtimes, throughput     |
+| `queuectl health`    | System diagnostics: DB, workers, queue, config     |
+| `queuectl dashboard` | Rich multi-panel terminal UI                       |
 
 ### Configuration
 
-| Command | Description |
-|---|---|
-| `queuectl config show` | Display all config values (alias: `list`) |
-| `queuectl config set <key> <value>` | Update a config key (validated before write) |
-| `queuectl config get <key>` | Read a single config value |
-| `queuectl config delete <key>` | Reset a key to its default |
-| `queuectl config reset [key]` | Reset one key or all keys to defaults |
-| `queuectl config export <file>` | Export config to JSON |
-| `queuectl config import <file>` | Import config from JSON (validated before applying) |
+| Command                             | Description                                         |
+| ----------------------------------- | --------------------------------------------------- |
+| `queuectl config show`              | Display all config values (alias: `list`)           |
+| `queuectl config set <key> <value>` | Update a config key (validated before write)        |
+| `queuectl config get <key>`         | Read a single config value                          |
+| `queuectl config delete <key>`      | Reset a key to its default                          |
+| `queuectl config reset [key]`       | Reset one key or all keys to defaults               |
+| `queuectl config export <file>`     | Export config to JSON                               |
+| `queuectl config import <file>`     | Import config from JSON (validated before applying) |
 
 ### Benchmark
 
-| Command | Description |
-|---|---|
+| Command                                   | Description                                                        |
+| ----------------------------------------- | ------------------------------------------------------------------ |
 | `queuectl benchmark --jobs N --workers W` | Performance test: enqueue N jobs, run W workers, report throughput |
 
 > All commands support `--help` for detailed usage.
@@ -321,23 +323,23 @@ $ queuectl config import backup.json
 
 ### Module Map
 
-| Module | Responsibility |
-|---|---|
-| `cli.py` | Click commands, Rich formatting, translates `QueueCTLError` → `ClickException` |
-| `queue_ops.py` | All job CRUD + lifecycle state transitions (`claim`, `complete`, `fail`) |
-| `config.py` | Config CRUD with per-key validators, `load_defaults` seeds on first use |
-| `dlq.py` | DLQ operations — delegates to `queue_ops.py`, never writes its own queries |
-| `metrics.py` | Computes stats from `job_logs` — delegates to `queue_ops.py` |
-| `validators.py` | Pure field validation — no DB access, reused by `create_job` and `update_job` |
-| `models.py` | SQLAlchemy ORM classes: `Job`, `Config`, `Worker`, `JobLog` |
-| `database.py` | Engine creation, `BEGIN IMMEDIATE` hooks, session factory |
-| `worker.py` | Single worker poll loop: claim → execute → complete/fail |
-| `worker_manager.py` | Spawns/stops worker OS processes, heartbeat tracking |
-| `executor.py` | `run_command()` — subprocess execution with process-tree timeout kill |
-| `retry.py` | Pure functions: `calculate_delay()` and `is_dead()` |
-| `app_logging.py` | Three log files: `worker.log`, `queuectl.log`, `error.log` |
-| `exceptions.py` | `QueueCTLError` base + `JobNotFoundError`, `DuplicateJobError`, etc. |
-| `constants.py` | State names, default config values, heartbeat thresholds |
+| Module              | Responsibility                                                                 |
+| ------------------- | ------------------------------------------------------------------------------ |
+| `cli.py`            | Click commands, Rich formatting, translates `QueueCTLError` → `ClickException` |
+| `queue_ops.py`      | All job CRUD + lifecycle state transitions (`claim`, `complete`, `fail`)       |
+| `config.py`         | Config CRUD with per-key validators, `load_defaults` seeds on first use        |
+| `dlq.py`            | DLQ operations — delegates to `queue_ops.py`, never writes its own queries     |
+| `metrics.py`        | Computes stats from `job_logs` — delegates to `queue_ops.py`                   |
+| `validators.py`     | Pure field validation — no DB access, reused by `create_job` and `update_job`  |
+| `models.py`         | SQLAlchemy ORM classes: `Job`, `Config`, `Worker`, `JobLog`                    |
+| `database.py`       | Engine creation, `BEGIN IMMEDIATE` hooks, session factory                      |
+| `worker.py`         | Single worker poll loop: claim → execute → complete/fail                       |
+| `worker_manager.py` | Spawns/stops worker OS processes, heartbeat tracking                           |
+| `executor.py`       | `run_command()` — subprocess execution with process-tree timeout kill          |
+| `retry.py`          | Pure functions: `calculate_delay()` and `is_dead()`                            |
+| `app_logging.py`    | Three log files: `worker.log`, `queuectl.log`, `error.log`                     |
+| `exceptions.py`     | `QueueCTLError` base + `JobNotFoundError`, `DuplicateJobError`, etc.           |
+| `constants.py`      | State names, default config values, heartbeat thresholds                       |
 
 ---
 
@@ -372,6 +374,7 @@ $ queuectl config import backup.json
 ```
 
 **Key points:**
+
 - `failed` stays visible as a distinct state (not reset to `pending`) so `queuectl list --state failed` accurately shows retrying jobs
 - `dead` = DLQ — no separate table, just a `state='dead'` filter
 - `claim_job` treats both `pending` and `failed` (with elapsed `next_retry`) as claimable
@@ -422,15 +425,15 @@ Four SQLAlchemy ORM tables in a single SQLite file:
 
 All tunables managed via `queuectl config`:
 
-| Key | Default | Description | Validation |
-|---|---|---|---|
-| `max_retries` | `3` | Default retry limit for new jobs | `≥ 0` |
-| `backoff_base` | `2` | Exponential backoff base (`delay = base^attempts`) | `> 1` |
-| `poll_interval` | `1` | Seconds between worker poll cycles | `> 0` |
-| `heartbeat_interval` | `2` | Seconds between worker heartbeat updates | `> 0` |
-| `timeout` | `30` | Default timeout (seconds); only applied if job explicitly sets it | `> 0` |
-| `default_priority` | `0` | Default priority for new jobs | `≥ 0` |
-| `max_workers` | `10` | Maximum concurrent workers | `> 0` |
+| Key                  | Default | Description                                                       | Validation |
+| -------------------- | ------- | ----------------------------------------------------------------- | ---------- |
+| `max_retries`        | `3`     | Default retry limit for new jobs                                  | `≥ 0`      |
+| `backoff_base`       | `2`     | Exponential backoff base (`delay = base^attempts`)                | `> 1`      |
+| `poll_interval`      | `1`     | Seconds between worker poll cycles                                | `> 0`      |
+| `heartbeat_interval` | `2`     | Seconds between worker heartbeat updates                          | `> 0`      |
+| `timeout`            | `30`    | Default timeout (seconds); only applied if job explicitly sets it | `> 0`      |
+| `default_priority`   | `0`     | Default priority for new jobs                                     | `≥ 0`      |
+| `max_workers`        | `10`    | Maximum concurrent workers                                        | `> 0`      |
 
 **Live reload:** `poll_interval` and `backoff_base` are read fresh each worker cycle — changes take effect on running workers immediately. `max_retries` and `priority` are captured per-job at enqueue time.
 
@@ -446,19 +449,19 @@ pytest
 
 One test file per module, mostly mock-free — real SQLite files, real threads for concurrency, real subprocesses for timeout tests.
 
-| Test File | Covers |
-|---|---|
-| `test_database.py` | Engine creation, session lifecycle |
-| `test_queue_ops.py` | CRUD, state transitions, **8-thread concurrent claim race** |
-| `test_executor.py` | Command execution, **timeout with process-tree kill** |
-| `test_retry.py` | Backoff delay calculation, dead/alive boundary |
-| `test_dlq.py` | DLQ list, retry, delete, state guard |
-| `test_worker.py` | Worker poll loop (background thread) |
-| `test_config.py` | Config CRUD, validation, export/import |
-| `test_metrics.py` | Stats computation |
-| `test_app_logging.py` | Log file creation, error propagation |
-| `test_worker_manager.py` | Worker spawn/stop |
-| `test_cli.py` | Full CLI via `CliRunner`, including benchmark |
+| Test File                | Covers                                                      |
+| ------------------------ | ----------------------------------------------------------- |
+| `test_database.py`       | Engine creation, session lifecycle                          |
+| `test_queue_ops.py`      | CRUD, state transitions, **8-thread concurrent claim race** |
+| `test_executor.py`       | Command execution, **timeout with process-tree kill**       |
+| `test_retry.py`          | Backoff delay calculation, dead/alive boundary              |
+| `test_dlq.py`            | DLQ list, retry, delete, state guard                        |
+| `test_worker.py`         | Worker poll loop (background thread)                        |
+| `test_config.py`         | Config CRUD, validation, export/import                      |
+| `test_metrics.py`        | Stats computation                                           |
+| `test_app_logging.py`    | Log file creation, error propagation                        |
+| `test_worker_manager.py` | Worker spawn/stop                                           |
+| `test_cli.py`            | Full CLI via `CliRunner`, including benchmark               |
 
 ### End-to-End Validation
 
@@ -502,13 +505,13 @@ queuectl benchmark --jobs 100 --workers 4
 
 `.github/workflows/ci.yml` runs on every push/PR to `main`:
 
-| Step | Tool |
-|---|---|
-| Formatting | `black --check` |
-| Import order | `isort --check-only` |
-| Unit tests | `pytest` |
-| DB integration | `scripts/validate_db.py` |
-| End-to-end | `scripts/validate_e2e.py` |
+| Step           | Tool                      |
+| -------------- | ------------------------- |
+| Formatting     | `black --check`           |
+| Import order   | `isort --check-only`      |
+| Unit tests     | `pytest`                  |
+| DB integration | `scripts/validate_db.py`  |
+| End-to-end     | `scripts/validate_e2e.py` |
 
 Runs on a **matrix of Ubuntu + Windows** across two Python versions, exercising both Windows-specific (`taskkill`, `cwd`-pinning) and POSIX (`os.killpg`, `SIGKILL`) code paths.
 
@@ -536,20 +539,20 @@ docker run -d --name queuectl-worker \
 
 ## 🏆 Bonus Features
 
-| Feature | Implementation |
-|---|---|
-| ⏱️ Job timeout handling | `timeout_seconds` per job; full process-tree kill on expiry |
-| 📊 Priority queues | `priority` field, `ORDER BY` in claim query; `--priority low/normal/high` |
-| 🕐 Scheduled/delayed jobs | `run_at` ISO timestamp; extra `WHERE` clause in claim query |
-| 📝 Job output logging | `job_logs` table: stdout, stderr, exit code, duration per attempt |
-| 📋 Operational logging | `worker.log`, `queuectl.log`, `error.log` (auto-propagated via Python logging hierarchy) |
-| 📈 Execution stats | `queuectl stats`: success/failure/retry rate, avg/min/max runtime, throughput |
-| 🩺 Health check | `queuectl health`: DB, workers, queue, DLQ, config diagnostics |
-| 🖥️ Rich dashboard | `queuectl dashboard`: multi-panel terminal UI |
-| ⚙️ Config import/export | `queuectl config export/import <file>`; per-key validation, atomic import |
-| 🏎️ Benchmark | `queuectl benchmark --jobs N --workers W` |
-| 🐳 Docker | `Dockerfile` with volume mount for persistent data |
-| 🔄 CI/CD | GitHub Actions: lint + test on Ubuntu & Windows matrix |
+| Feature                   | Implementation                                                                           |
+| ------------------------- | ---------------------------------------------------------------------------------------- |
+| ⏱️ Job timeout handling   | `timeout_seconds` per job; full process-tree kill on expiry                              |
+| 📊 Priority queues        | `priority` field, `ORDER BY` in claim query; `--priority low/normal/high`                |
+| 🕐 Scheduled/delayed jobs | `run_at` ISO timestamp; extra `WHERE` clause in claim query                              |
+| 📝 Job output logging     | `job_logs` table: stdout, stderr, exit code, duration per attempt                        |
+| 📋 Operational logging    | `worker.log`, `queuectl.log`, `error.log` (auto-propagated via Python logging hierarchy) |
+| 📈 Execution stats        | `queuectl stats`: success/failure/retry rate, avg/min/max runtime, throughput            |
+| 🩺 Health check           | `queuectl health`: DB, workers, queue, DLQ, config diagnostics                           |
+| 🖥️ Rich dashboard         | `queuectl dashboard`: multi-panel terminal UI                                            |
+| ⚙️ Config import/export   | `queuectl config export/import <file>`; per-key validation, atomic import                |
+| 🏎️ Benchmark              | `queuectl benchmark --jobs N --workers W`                                                |
+| 🐳 Docker                 | `Dockerfile` with volume mount for persistent data                                       |
+| 🔄 CI/CD                  | GitHub Actions: lint + test on Ubuntu & Windows matrix                                   |
 
 ---
 
@@ -559,48 +562,56 @@ docker run -d --name queuectl-worker \
 <summary><b>🔒 SQLite over JSON files</b></summary>
 
 SQLite provides real transactional locking (`BEGIN IMMEDIATE`) out of the box — exactly what's needed to prevent duplicate job claims across worker processes. A hand-rolled JSON + file lock would reimplement the same guarantee less reliably.
+
 </details>
 
 <details>
 <summary><b>🗃️ SQLAlchemy ORM over raw sqlite3</b></summary>
 
 Models are declarative Python classes instead of hand-written SQL. The one cost: SQLAlchemy's default SQLite driver doesn't naturally support `BEGIN IMMEDIATE`, so `database.py` disables pysqlite's implicit transactions and re-emits it manually via engine events.
+
 </details>
 
 <details>
 <summary><b>👷 OS processes, not threads</b></summary>
 
 Workers are separate OS processes — mirrors real deployment, provides crash isolation, sidesteps the GIL. Worker liveness is tracked via DB row + heartbeat instead of in-memory handles.
+
 </details>
 
 <details>
 <summary><b>🛑 Cooperative stop via DB flag, not OS signals</b></summary>
 
 Chosen for cross-platform consistency (developed/tested on Windows). Workers check `stop_requested` between jobs — a running job is never interrupted. Trade-off: up to one `poll_interval` delay before a stop is noticed.
+
 </details>
 
 <details>
 <summary><b>💀 DLQ is a state, not a separate store</b></summary>
 
 `dead` is just another job state — DLQ operations reuse the same schema and code paths instead of duplicating them.
+
 </details>
 
 <details>
 <summary><b>🐚 shell=True for job commands</b></summary>
 
 Matches the assignment's `sleep 2` / `echo hello` examples. Commands are trusted input — same assumption as any cron-like job runner.
+
 </details>
 
 <details>
 <summary><b>⏱️ Timeout kills the process tree, not just the shell</b></summary>
 
 With `shell=True`, the real command runs as a grandchild process. `executor.py` uses `Popen` + manual `TimeoutExpired` handler that kills the entire tree (`taskkill /F /T` on Windows, `os.killpg` on POSIX) instead of just the direct child.
+
 </details>
 
 <details>
 <summary><b>🔄 Failed jobs stay `failed`, not reset to `pending`</b></summary>
 
 A retry-scheduled job keeps `state='failed'` until its backoff elapses. This preserves observability — `queuectl list --state failed` accurately counts retrying jobs. The claim query treats both `pending` and eligible `failed` jobs as claimable.
+
 </details>
 
 ---
@@ -609,11 +620,11 @@ A retry-scheduled job keeps `state='failed'` until its backoff elapses. This pre
 
 Three operational log files (override directory with `QUEUECTL_LOG_DIR`, default `./logs`):
 
-| Log File | Contents |
-|---|---|
-| `worker.log` | Worker lifecycle: started, picked up job, completed/failed/DLQ, stopped |
-| `queuectl.log` | CLI events: job created/deleted, config changed, DLQ manual retry |
-| `error.log` | All `ERROR`-level records (auto-collected via Python logging propagation) |
+| Log File       | Contents                                                                  |
+| -------------- | ------------------------------------------------------------------------- |
+| `worker.log`   | Worker lifecycle: started, picked up job, completed/failed/DLQ, stopped   |
+| `queuectl.log` | CLI events: job created/deleted, config changed, DLQ manual retry         |
+| `error.log`    | All `ERROR`-level records (auto-collected via Python logging propagation) |
 
 > These are separate from the `job_logs` DB table, which stores structured per-attempt stdout/stderr/exit-code data.
 
@@ -621,12 +632,12 @@ Three operational log files (override directory with `QUEUECTL_LOG_DIR`, default
 
 ## 🔮 Future Improvements
 
-| Area | Description |
-|---|---|
+| Area                         | Description                                                                                                                                                                          |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **Redis/PostgreSQL backend** | SQLite's single-writer model tops out before high-throughput needs. Redis (`RPOPLPUSH`) or PostgreSQL (`SELECT ... FOR UPDATE SKIP LOCKED`) would remove the single-machine ceiling. |
-| **REST API** | A FastAPI/Flask layer over `queue_ops.py`/`dlq.py` would expose operations to non-CLI clients without duplicating business logic. |
-| **Distributed workers** | Workers are already crash-isolated OS processes — swapping the backend enables Kubernetes deployments with `HorizontalPodAutoscaler` on queue depth. |
-| **Web dashboard** | `queuectl dashboard` already renders from the same data functions a web UI would use — a Flask + HTMX frontend could reuse that data layer as-is. |
+| **REST API**                 | A FastAPI/Flask layer over `queue_ops.py`/`dlq.py` would expose operations to non-CLI clients without duplicating business logic.                                                    |
+| **Distributed workers**      | Workers are already crash-isolated OS processes — swapping the backend enables Kubernetes deployments with `HorizontalPodAutoscaler` on queue depth.                                 |
+| **Web dashboard**            | `queuectl dashboard` already renders from the same data functions a web UI would use — a Flask + HTMX frontend could reuse that data layer as-is.                                    |
 
 ---
 
