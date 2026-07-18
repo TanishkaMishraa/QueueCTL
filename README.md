@@ -632,7 +632,7 @@ Three operational log files (override directory with `QUEUECTL_LOG_DIR`, default
 
 ## 🎬 Demo
 
-[▶️ Watch the project demo video](https://drive.google.com/file/d/1aV68kVGea_eJX5e3vk5XoNoSCDns161z/view?usp=drive_link)
+[▶️ Watch the project demo video](https://drive.google.com/drive/folders/171bTidnP3uwwvDEmn7IiJq5qlQ5qIJHj?hl=en)
 
 ---
 
